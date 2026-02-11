@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::{
     action::Action,
-    components::{Component, fps::FpsCounter, mongo_viewer::MongoViewer},
+    components::{Component, mongo_viewer::MongoViewer},
     config::Config,
     tui::{Event, Tui},
 };
@@ -36,7 +36,7 @@ impl App {
         Ok(Self {
             tick_rate,
             frame_rate,
-            components: vec![Box::new(MongoViewer::new()), Box::new(FpsCounter::default())],
+            components: vec![Box::new(MongoViewer::new())],
             should_quit: false,
             should_suspend: false,
             config: Config::new()?,
