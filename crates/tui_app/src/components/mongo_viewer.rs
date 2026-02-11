@@ -1,5 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use syntect::{
+    easy::HighlightLines,
+    highlighting::ThemeSet,
+    parsing::SyntaxSet,
+};
+use syntect_tui::into_span;
+use arboard::Clipboard;
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use mongo_core::{DatabaseInfo, MongoCore};
@@ -44,7 +51,7 @@ enum PopupState {
         active_field: QueryField,
     },
     #[allow(dead_code)]
-    JsonViewer(String),
+    JsonViewer(String, String, usize), // json, doc_id, offset
     FieldSelector(ListState),
 }
 
@@ -93,11 +100,17 @@ pub struct MongoViewer {
     // Navigation
     document_table_state: TableState,
     document_list_state: ListState,
+    selected_column_index: usize,
 
     // Config
     visible_fields: Vec<String>,
     all_fields: Vec<String>,
     expanded_docs: HashMap<usize, bool>, // For JSON view folding
+    
+    // System
+    clipboard: Option<Clipboard>,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
 }
 
 impl Default for MongoViewer {
@@ -133,9 +146,13 @@ impl Default for MongoViewer {
             input_validation_errors: HashMap::new(),
             document_table_state: TableState::default(),
             document_list_state: ListState::default(),
+            selected_column_index: 0,
             visible_fields: vec!["_id".to_string()],
             all_fields: vec![],
             expanded_docs: HashMap::new(),
+            clipboard: Clipboard::new().ok(),
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
         }
     }
 }
@@ -216,10 +233,21 @@ impl Component for MongoViewer {
              }
         }
         
-        if let PopupState::JsonViewer(_) = self.popup_state {
-             if key.code == KeyCode::Esc {
-                self.popup_state = PopupState::None;
-                return Ok(Some(Action::Render));
+        if let PopupState::JsonViewer(json, _, offset) = &mut self.popup_state {
+             match key.code {
+                 KeyCode::Esc => {
+                    self.popup_state = PopupState::None;
+                    return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Down | KeyCode::Char('j') => {
+                     *offset = offset.saturating_add(1);
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Up | KeyCode::Char('k') => {
+                     *offset = offset.saturating_sub(1);
+                     return Ok(Some(Action::Render));
+                 }
+                 _ => {}
              }
              return Ok(None);
         }
@@ -472,7 +500,138 @@ impl Component for MongoViewer {
                           }
                     }
                     ActivePane::Documents => {
-                        // Scroll documents
+                        match key.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let len = self.documents.len();
+                                if len > 0 {
+                                    if self.view_mode == ViewMode::Table {
+                                        let i = match self.document_table_state.selected() {
+                                            Some(i) => if i >= len - 1 { len - 1 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        self.document_table_state.select(Some(i));
+                                        // Sync list state
+                                        self.document_list_state.select(Some(i));
+                                    } else {
+                                        let i = match self.document_list_state.selected() {
+                                            Some(i) => if i >= len - 1 { len - 1 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        self.document_list_state.select(Some(i));
+                                        // Sync table state
+                                        self.document_table_state.select(Some(i));
+                                    }
+                                    return Ok(Some(Action::Render));
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let len = self.documents.len();
+                                if len > 0 {
+                                     if self.view_mode == ViewMode::Table {
+                                        let i = match self.document_table_state.selected() {
+                                            Some(i) => if i == 0 { 0 } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        self.document_table_state.select(Some(i));
+                                        // Sync list state
+                                        self.document_list_state.select(Some(i));
+                                    } else {
+                                        let i = match self.document_list_state.selected() {
+                                            Some(i) => if i == 0 { 0 } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        self.document_list_state.select(Some(i));
+                                        // Sync table state
+                                        self.document_table_state.select(Some(i));
+                                    }
+                                    return Ok(Some(Action::Render));
+                                }
+                            }
+                            KeyCode::Left | KeyCode::Char('h') if self.view_mode == ViewMode::Table => {
+                                if self.selected_column_index > 0 {
+                                    self.selected_column_index -= 1;
+                                    return Ok(Some(Action::Render));
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') if self.view_mode == ViewMode::Table => {
+                                if self.selected_column_index < self.visible_fields.len().saturating_sub(1) {
+                                    self.selected_column_index += 1;
+                                    return Ok(Some(Action::Render));
+                                }
+                            }
+                            KeyCode::Char('y') => {
+                                if let Some(idx) = self.document_table_state.selected() {
+                                    if let Some(doc) = self.documents.get(idx) {
+                                        let val = if let Ok(id) = doc.get_object_id("_id") {
+                                            id.to_string()
+                                        } else if let Some(id) = doc.get("_id") {
+                                            id.to_string()
+                                        } else {
+                                            String::new()
+                                        };
+                                        
+                                        if let Some(clipboard) = &mut self.clipboard {
+                                            let _ = clipboard.set_text(val);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('Y') => {
+                                if let Some(idx) = self.document_table_state.selected() {
+                                    if let Some(doc) = self.documents.get(idx) {
+                                        if let Ok(json) = serde_json::to_string_pretty(doc) {
+                                            if let Some(clipboard) = &mut self.clipboard {
+                                                let _ = clipboard.set_text(json);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('p') if self.view_mode == ViewMode::Table => {
+                                if let Some(idx) = self.document_table_state.selected() {
+                                    if let Some(doc) = self.documents.get(idx) {
+                                        if let Some(field) = self.visible_fields.get(self.selected_column_index) {
+                                            let val = doc.get(field).map(|v| v.to_string()).unwrap_or_default();
+                                            if let Some(clipboard) = &mut self.clipboard {
+                                                let _ = clipboard.set_text(val);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('P') if self.view_mode == ViewMode::Table => {
+                                if let Some(field) = self.visible_fields.get(self.selected_column_index) {
+                                    if let Some(clipboard) = &mut self.clipboard {
+                                        let _ = clipboard.set_text(field.clone());
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // View full document
+                                let selected_idx = if self.view_mode == ViewMode::Table {
+                                    self.document_table_state.selected()
+                                } else {
+                                    self.document_list_state.selected()
+                                };
+
+                                if let Some(idx) = selected_idx {
+                                    if let Some(doc) = self.documents.get(idx) {
+                                        if let Ok(json) = serde_json::to_string_pretty(doc) {
+                                            let id_str = if let Ok(id) = doc.get_object_id("_id") {
+                                                id.to_string()
+                                            } else if let Some(id) = doc.get("_id") {
+                                                id.to_string()
+                                            } else {
+                                                "?".to_string()
+                                            };
+                                            self.popup_state = PopupState::JsonViewer(json, id_str, 0);
+                                            return Ok(Some(Action::Render));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     ActivePane::Query => {
                         match key.code {
@@ -618,6 +777,10 @@ impl Component for MongoViewer {
                 }
                 Action::DocumentsLoaded(docs) => {
                     self.documents = docs;
+                    
+                    // Reset visible fields to default
+                    self.visible_fields = vec!["_id".to_string()];
+
                     // Update all_fields based on keys in the first few documents
                     let mut fields = std::collections::HashSet::new();
                     for doc in self.documents.iter().take(20) {
@@ -629,8 +792,16 @@ impl Component for MongoViewer {
                     sorted_fields.sort();
                     self.all_fields = sorted_fields;
                     
-                    // If visible fields is default only, maybe auto-populate? 
-                    // For now keep default "_id"
+                    // Add a few more fields to visible by default if available, but not too many
+                    for field in self.all_fields.iter() {
+                        if field != "_id" && self.visible_fields.len() < 5 {
+                             self.visible_fields.push(field.clone());
+                        }
+                    }
+                    
+                    // Reset selection
+                    self.document_table_state.select(if !self.documents.is_empty() { Some(0) } else { None });
+                    self.document_list_state.select(if !self.documents.is_empty() { Some(0) } else { None });
                 }
                 _ => {}
             }
@@ -672,7 +843,7 @@ impl Component for MongoViewer {
         let mut popup = std::mem::replace(&mut self.popup_state, PopupState::None);
         
         match &mut popup {
-            PopupState::JsonViewer(json) => self.draw_json_popup(f, area, json),
+            PopupState::JsonViewer(json, id, offset) => self.draw_json_popup(f, area, json, id, *offset),
             PopupState::ConnectionManager { name, uri, is_editing_uri } => {
                 self.draw_connection_manager_popup(f, area, name, uri, *is_editing_uri)
             },
@@ -792,27 +963,77 @@ impl MongoViewer {
              return;
         }
 
-        let block = Block::default()
-            .title(if self.view_mode == ViewMode::Table {
-                "Documents (Table)"
+        // Breadcrumb: <conn> / <db> / <coll>
+        let conn_name = self.selected_conn_index
+            .and_then(|i| self.connections.get(i))
+            .map(|c| c.name.as_str())
+            .unwrap_or("?");
+        
+        let db_name = self.selected_db_index
+            .and_then(|i| self.databases.get(i))
+            .map(|d| d.name.as_str())
+            .unwrap_or("?");
+
+        let coll_name = if let (Some(db_idx), Some(coll_idx)) = (self.selected_db_index, self.selected_coll_index) {
+             self.databases.get(db_idx)
+                .and_then(|db| db.collections.get(coll_idx))
+                .map(|c| c.name.as_str())
+                .unwrap_or("?")
+        } else {
+            "?"
+        };
+        let breadcrumb = format!(" {} / {} / {} ", conn_name, db_name, coll_name);
+
+        // View Mode
+        let view_mode_str = if self.view_mode == ViewMode::Table { " Table " } else { " JSON " };
+
+        // Count
+        let count_str = format!(" Count: {} ", self.documents.len());
+        
+        // Shortcuts (only if a document is selected)
+        let has_selection = self.document_table_state.selected().is_some();
+        let shortcuts_str = if has_selection {
+            if self.view_mode == ViewMode::Table {
+                 " y: copy _id | Y: copy doc | p: copy val | P: copy key "
             } else {
-                "Documents (JSON)"
-            })
+                 " y: copy _id | Y: copy doc "
+            }
+        } else {
+            ""
+        };
+
+        let block = Block::default()
             .borders(Borders::ALL)
             .border_style(if self.active_pane == ActivePane::Documents {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default()
-            });
+            })
+            .title_top(Line::from(breadcrumb).alignment(Alignment::Left))
+            .title_top(Line::from(view_mode_str).alignment(Alignment::Right))
+            .title_bottom(Line::from(shortcuts_str).alignment(Alignment::Left))
+            .title_bottom(Line::from(count_str).alignment(Alignment::Right));
             
         if self.view_mode == ViewMode::Table {
-             let header_cells = self.visible_fields.iter().map(|h| Cell::from(h.clone()).style(Style::default().fg(Color::Red)));
+             let header_cells = self.visible_fields.iter().enumerate().map(|(i, h)| {
+                 let style = if i == self.selected_column_index && self.active_pane == ActivePane::Documents {
+                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                 } else {
+                     Style::default().fg(Color::Red)
+                 };
+                 Cell::from(h.clone()).style(style)
+             });
              let header = Row::new(header_cells).height(1).bottom_margin(1);
              
-             let rows: Vec<Row> = self.documents.iter().map(|doc| {
-                 let cells = self.visible_fields.iter().map(|field| {
+             let rows: Vec<Row> = self.documents.iter().enumerate().map(|(row_idx, doc)| {
+                 let is_row_selected = self.document_table_state.selected() == Some(row_idx);
+                 let cells = self.visible_fields.iter().enumerate().map(|(col_idx, field)| {
                      let val = doc.get(field).map(|v| v.to_string()).unwrap_or_default();
-                     Cell::from(val)
+                     let mut cell = Cell::from(val);
+                     if is_row_selected && col_idx == self.selected_column_index && self.active_pane == ActivePane::Documents {
+                         cell = cell.style(Style::default().bg(Color::LightBlue).fg(Color::Black));
+                     }
+                     cell
                  });
                  Row::new(cells).height(1)
              }).collect();
@@ -862,13 +1083,59 @@ impl MongoViewer {
         }
     }
 
-    fn draw_json_popup(&self, f: &mut Frame, area: Rect, json: &str) {
+    fn draw_json_popup(&self, f: &mut Frame, area: Rect, json: &str, doc_id: &str, offset: usize) {
         let popup_area = centered_rect(area, 80, 80);
         f.render_widget(Clear, popup_area);
-        let block = Block::default().title("Full JSON").borders(Borders::ALL);
-        let p = Paragraph::new(json.to_string())
+        
+        // Breadcrumb: <conn> / <db> / <coll> / <id>
+        let conn_name = self.selected_conn_index
+            .and_then(|i| self.connections.get(i))
+            .map(|c| c.name.as_str())
+            .unwrap_or("?");
+        
+        let db_name = self.selected_db_index
+            .and_then(|i| self.databases.get(i))
+            .map(|d| d.name.as_str())
+            .unwrap_or("?");
+
+        let coll_name = if let (Some(db_idx), Some(coll_idx)) = (self.selected_db_index, self.selected_coll_index) {
+             self.databases.get(db_idx)
+                .and_then(|db| db.collections.get(coll_idx))
+                .map(|c| c.name.as_str())
+                .unwrap_or("?")
+        } else {
+            "?"
+        };
+        let breadcrumb = format!(" {} / {} / {} / {} ", conn_name, db_name, coll_name, doc_id);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title_top(Line::from(breadcrumb).alignment(Alignment::Left));
+            
+        // Syntax Highlighting
+        let syntax = self.syntax_set.find_syntax_by_extension("json").unwrap();
+        let theme = &self.theme_set.themes["base16-ocean.dark"];
+        let mut h = HighlightLines::new(syntax, theme);
+        
+        let mut spans = Vec::new();
+        for line in json.lines() {
+            let ranges = h.highlight_line(line, &self.syntax_set).unwrap();
+            let line_spans: Vec<Span> = ranges.into_iter()
+                .filter_map(|(style, content)| {
+                    into_span((style, content)).ok().map(|mut span| {
+                        // Force background to be transparent/reset to avoid clashing with TUI theme
+                        span.style = span.style.bg(Color::Reset);
+                        span
+                    })
+                })
+                .collect();
+            spans.push(Line::from(line_spans));
+        }
+        
+        let p = Paragraph::new(spans)
             .block(block)
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((offset as u16, 0));
         f.render_widget(p, popup_area);
     }
 
@@ -1018,7 +1285,7 @@ impl MongoViewer {
         let help_text = match &self.popup_state {
             PopupState::ConnectionManager { .. } => "Tab: Next Field | Enter: Save | Esc: Cancel",
             PopupState::QueryBuilder { .. } => "Tab: Next Field | Enter: Run | Esc: Cancel",
-            PopupState::JsonViewer(_) => "Esc: Close",
+            PopupState::JsonViewer(..) => "Esc: Close",
             PopupState::FieldSelector(_) => "Space/Enter: Toggle | Esc: Close | \u{2191}/\u{2193}: Nav",
             PopupState::None => match self.active_pane {
                 ActivePane::Connections => "c: New | Enter: Connect | \u{2191}/\u{2193}: Nav | Tab: Next Pane | q: Quit",
