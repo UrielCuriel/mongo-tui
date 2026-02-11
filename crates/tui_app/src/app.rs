@@ -2,7 +2,7 @@ use crossterm::event::KeyEvent;
 use ratatui::prelude::Rect;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     action::Action,
@@ -18,7 +18,7 @@ pub struct App {
     components: Vec<Box<dyn Component>>,
     should_quit: bool,
     should_suspend: bool,
-    mode: Mode,
+    _mode: Mode,
     last_tick_key_events: Vec<KeyEvent>,
     action_tx: mpsc::UnboundedSender<Action>,
     action_rx: mpsc::UnboundedReceiver<Action>,
@@ -40,7 +40,7 @@ impl App {
             should_quit: false,
             should_suspend: false,
             config: Config::new()?,
-            mode: Mode::Home,
+            _mode: Mode::Home,
             last_tick_key_events: Vec::new(),
             action_tx,
             action_rx,
@@ -103,8 +103,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
-        let action_tx = self.action_tx.clone();
+    fn handle_key_event(&mut self, _key: KeyEvent) -> color_eyre::Result<()> {
         // Since config keybindings are mostly empty now, we rely on component key handling
         // But if there were global keybindings, we'd check them here.
         Ok(())

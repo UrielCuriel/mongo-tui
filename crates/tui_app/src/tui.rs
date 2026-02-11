@@ -1,13 +1,10 @@
-use std::{
-    ops::{Deref, DerefMut},
-    time::Duration,
-};
+use std::ops::{Deref, DerefMut};
 
 use color_eyre::eyre::Result;
 use crossterm::{
     cursor,
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
+        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream,
         KeyEvent, KeyEventKind,
     },
     execute,
@@ -21,7 +18,6 @@ use tokio::{
     task::JoinHandle,
     time::interval,
 };
-use tracing::error;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Event {

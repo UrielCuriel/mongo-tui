@@ -1,9 +1,7 @@
-use ratatui::prelude::*;
-use ratatui::widgets::{Block, Paragraph};
-use tokio::sync::mpsc::UnboundedSender;
-
 use super::Component;
-use crate::{action::Action, config::Config, tui::Event};
+use crate::action::Action;
+use ratatui::prelude::*;
+use ratatui::widgets::Paragraph;
 
 #[derive(Default)]
 pub struct FpsCounter {

@@ -24,6 +24,14 @@ enum ActivePane {
     Documents,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum QueryField {
+    Filter,
+    Sort,
+    Limit,
+    Projection,
+}
+
 #[derive(Debug, Clone)]
 enum PopupState {
     None,
@@ -32,6 +40,10 @@ enum PopupState {
         uri: TextArea<'static>,
         is_editing_uri: bool, // Toggle focus between name/uri
     },
+    QueryBuilder {
+        active_field: QueryField,
+    },
+    #[allow(dead_code)]
     JsonViewer(String),
     FieldSelector(ListState),
 }
@@ -76,10 +88,9 @@ pub struct MongoViewer {
     projection_input: TextArea<'static>,
     sort_input: TextArea<'static>,
     limit_input: TextArea<'static>,
+    input_validation_errors: HashMap<QueryField, String>,
 
     // Navigation
-    sidebar_state: ListState,
-    database_list_state: ListState,
     document_table_state: TableState,
     document_list_state: ListState,
 
@@ -119,8 +130,7 @@ impl Default for MongoViewer {
             projection_input: proj,
             sort_input: sort,
             limit_input: limit,
-            sidebar_state: ListState::default(),
-            database_list_state: ListState::default(),
+            input_validation_errors: HashMap::new(),
             document_table_state: TableState::default(),
             document_list_state: ListState::default(),
             visible_fields: vec!["_id".to_string()],
@@ -212,6 +222,103 @@ impl Component for MongoViewer {
                 return Ok(Some(Action::Render));
              }
              return Ok(None);
+        }
+
+        if let PopupState::QueryBuilder { active_field } = &mut self.popup_state {
+             match key.code {
+                 KeyCode::Esc => {
+                     self.popup_state = PopupState::None;
+                     self.input_validation_errors.clear();
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Tab => {
+                     *active_field = match active_field {
+                         QueryField::Filter => QueryField::Sort,
+                         QueryField::Sort => QueryField::Projection,
+                         QueryField::Projection => QueryField::Limit,
+                         QueryField::Limit => QueryField::Filter,
+                     };
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::BackTab => {
+                     *active_field = match active_field {
+                         QueryField::Filter => QueryField::Limit,
+                         QueryField::Sort => QueryField::Filter,
+                         QueryField::Projection => QueryField::Sort,
+                         QueryField::Limit => QueryField::Projection,
+                     };
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Enter => {
+                     // Validate
+                     self.input_validation_errors.clear();
+                     let mut is_valid = true;
+
+                     // Filter
+                     let filter_str = self.query_input.lines().join("\n");
+                     if !filter_str.trim().is_empty() {
+                         if let Err(e) = serde_json::from_str::<serde_json::Value>(&filter_str) {
+                              self.input_validation_errors.insert(QueryField::Filter, format!("Invalid JSON: {}", e));
+                              is_valid = false;
+                         }
+                     }
+
+                     // Sort
+                     let sort_str = self.sort_input.lines().join("\n");
+                     if !sort_str.trim().is_empty() {
+                         if let Err(e) = serde_json::from_str::<serde_json::Value>(&sort_str) {
+                              self.input_validation_errors.insert(QueryField::Sort, format!("Invalid JSON: {}", e));
+                              is_valid = false;
+                         }
+                     }
+
+                     // Projection
+                     let proj_str = self.projection_input.lines().join("\n");
+                     if !proj_str.trim().is_empty() {
+                         if let Err(e) = serde_json::from_str::<serde_json::Value>(&proj_str) {
+                              self.input_validation_errors.insert(QueryField::Projection, format!("Invalid JSON: {}", e));
+                              is_valid = false;
+                         }
+                     }
+
+                     // Limit
+                     let limit_str = self.limit_input.lines().join("");
+                     if !limit_str.trim().is_empty() {
+                         if limit_str.parse::<i64>().is_err() {
+                             self.input_validation_errors.insert(QueryField::Limit, "Must be a number".to_string());
+                             is_valid = false;
+                         }
+                     }
+
+                     if is_valid {
+                         self.popup_state = PopupState::None;
+                         return Ok(Some(Action::RefreshDocuments));
+                     } else {
+                         return Ok(Some(Action::Render));
+                     }
+                 }
+                 _ => {
+                     match active_field {
+                         QueryField::Filter => { 
+                             self.query_input.input(key); 
+                             self.input_validation_errors.remove(&QueryField::Filter);
+                         }
+                         QueryField::Sort => { 
+                             self.sort_input.input(key); 
+                             self.input_validation_errors.remove(&QueryField::Sort);
+                         }
+                         QueryField::Projection => { 
+                             self.projection_input.input(key); 
+                             self.input_validation_errors.remove(&QueryField::Projection);
+                         }
+                         QueryField::Limit => { 
+                             self.limit_input.input(key); 
+                             self.input_validation_errors.remove(&QueryField::Limit);
+                         }
+                     }
+                     return Ok(Some(Action::Render));
+                 }
+             }
         }
 
         if let PopupState::FieldSelector(state) = &mut self.popup_state {
@@ -370,13 +477,11 @@ impl Component for MongoViewer {
                     ActivePane::Query => {
                         match key.code {
                             KeyCode::Enter => {
-                                // Submit query
-                                return Ok(Some(Action::RefreshDocuments));
-                            }
-                            _ => {
-                                self.query_input.input(key);
+                                // Open Query Builder
+                                self.popup_state = PopupState::QueryBuilder { active_field: QueryField::Filter };
                                 return Ok(Some(Action::Render));
                             }
+                            _ => {} 
                         }
                     }
                 }
@@ -467,9 +572,34 @@ impl Component for MongoViewer {
                                      None
                                  };
                                  
-                                 let projection = None;
-                                 let sort = None;
-                                 let limit = Some(20);
+                                 let projection_str = self.projection_input.lines().join("\n");
+                                 let projection: Option<mongo_core::bson::Document> = if !projection_str.trim().is_empty() {
+                                     match serde_json::from_str::<serde_json::Value>(&projection_str) {
+                                         Ok(val) => match mongo_core::bson::to_document(&val) {
+                                             Ok(doc) => Some(doc),
+                                             Err(_) => None 
+                                         },
+                                         Err(_) => None
+                                     }
+                                 } else {
+                                     None
+                                 };
+
+                                 let sort_str = self.sort_input.lines().join("\n");
+                                 let sort: Option<mongo_core::bson::Document> = if !sort_str.trim().is_empty() {
+                                     match serde_json::from_str::<serde_json::Value>(&sort_str) {
+                                         Ok(val) => match mongo_core::bson::to_document(&val) {
+                                             Ok(doc) => Some(doc),
+                                             Err(_) => None 
+                                         },
+                                         Err(_) => None
+                                     }
+                                 } else {
+                                     None
+                                 };
+
+                                 let limit_str = self.limit_input.lines().join("");
+                                 let limit = limit_str.parse::<i64>().ok();
                                  let skip = None;
                                  
                                  tokio::spawn(async move {
@@ -545,6 +675,9 @@ impl Component for MongoViewer {
             PopupState::JsonViewer(json) => self.draw_json_popup(f, area, json),
             PopupState::ConnectionManager { name, uri, is_editing_uri } => {
                 self.draw_connection_manager_popup(f, area, name, uri, *is_editing_uri)
+            },
+            PopupState::QueryBuilder { active_field } => {
+                self.draw_query_builder_popup(f, area, active_field);
             },
             PopupState::FieldSelector(state) => {
                 self.draw_field_selector(f, area, state);
@@ -628,7 +761,7 @@ impl MongoViewer {
 
     fn draw_query_bar(&self, f: &mut Frame, area: Rect) {
         let block = Block::default()
-            .title("Query Filter")
+            .title("Query Filter (Enter to edit)")
             .borders(Borders::ALL)
             .border_style(if self.active_pane == ActivePane::Query {
                 Style::default().fg(Color::Yellow)
@@ -636,14 +769,26 @@ impl MongoViewer {
                 Style::default()
             });
 
-        f.render_widget(&self.query_input, area); // Placeholder implementation
+        // Show a summary of the filter or "Empty"
+        let filter_text = self.query_input.lines().join(" ");
+        let display_text = if filter_text.trim().is_empty() {
+             "{}"
+        } else {
+             &filter_text
+        };
+        
+        let p = Paragraph::new(display_text)
+            .block(block)
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(p, area); 
     }
 
     fn draw_documents(&mut self, f: &mut Frame, area: Rect) {
         if self.selected_coll_index.is_none() {
              // Show help text or empty
              let block = Block::default().borders(Borders::ALL).title("Info");
-             f.render_widget(Paragraph::new("Select a collection to view documents."), area);
+             f.render_widget(Paragraph::new("Select a collection to view documents.").block(block), area);
              return;
         }
 
@@ -766,6 +911,89 @@ impl MongoViewer {
         f.render_widget(&uri_widget, chunks[1]);
     }
 
+    fn draw_query_builder_popup(&self, f: &mut Frame, area: Rect, active_field: &QueryField) {
+        let popup_area = centered_rect(area, 70, 70);
+        f.render_widget(Clear, popup_area);
+
+        let block = Block::default()
+            .title("Query Builder (Tab: Next Field | Enter: Run | Esc: Cancel)")
+            .borders(Borders::ALL);
+        f.render_widget(block, popup_area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([
+                Constraint::Percentage(40), // Filter
+                Constraint::Percentage(20), // Sort
+                Constraint::Percentage(20), // Projection
+                Constraint::Length(3),      // Limit
+                Constraint::Min(0),
+            ])
+            .split(popup_area);
+
+        let get_style_and_title = |field: QueryField, title: &str| {
+            let is_active = *active_field == field;
+            let error = self.input_validation_errors.get(&field);
+            
+            let mut style = Style::default();
+            if is_active {
+                style = style.fg(Color::Yellow);
+            }
+            if error.is_some() {
+                style = style.fg(Color::Red);
+            }
+
+            let title_text = if let Some(err) = error {
+                format!("{} - Error: {}", title, err)
+            } else {
+                title.to_string()
+            };
+            
+            (style, title_text)
+        };
+
+        let (style, title) = get_style_and_title(QueryField::Filter, "Filter (JSON)");
+        let mut filter_widget = self.query_input.clone();
+        filter_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(style),
+        );
+        f.render_widget(&filter_widget, chunks[0]);
+
+        let (style, title) = get_style_and_title(QueryField::Sort, "Sort (JSON)");
+        let mut sort_widget = self.sort_input.clone();
+        sort_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(style),
+        );
+        f.render_widget(&sort_widget, chunks[1]);
+        
+        let (style, title) = get_style_and_title(QueryField::Projection, "Projection (JSON)");
+        let mut proj_widget = self.projection_input.clone();
+        proj_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(style),
+        );
+        f.render_widget(&proj_widget, chunks[2]);
+
+        let (style, title) = get_style_and_title(QueryField::Limit, "Limit");
+        let mut limit_widget = self.limit_input.clone();
+        limit_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(style),
+        );
+        f.render_widget(&limit_widget, chunks[3]);
+    }
+
     fn draw_field_selector(&self, f: &mut Frame, area: Rect, state: &mut ListState) {
         let popup_area = centered_rect(area, 60, 60);
         f.render_widget(Clear, popup_area);
@@ -789,6 +1017,7 @@ impl MongoViewer {
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let help_text = match &self.popup_state {
             PopupState::ConnectionManager { .. } => "Tab: Next Field | Enter: Save | Esc: Cancel",
+            PopupState::QueryBuilder { .. } => "Tab: Next Field | Enter: Run | Esc: Cancel",
             PopupState::JsonViewer(_) => "Esc: Close",
             PopupState::FieldSelector(_) => "Space/Enter: Toggle | Esc: Close | \u{2191}/\u{2193}: Nav",
             PopupState::None => match self.active_pane {
