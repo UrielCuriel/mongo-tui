@@ -1,0 +1,828 @@
+use std::collections::{HashMap, HashSet};
+
+use color_eyre::eyre::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+use mongo_core::{DatabaseInfo, MongoCore};
+use ratatui::{
+    prelude::*,
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Wrap,
+    },
+};
+use tokio::sync::mpsc::UnboundedSender;
+use tui_textarea::TextArea;
+
+use super::Component;
+use crate::{action::Action, config::{Config, Connection}};
+
+#[derive(Debug, Clone, PartialEq)]
+enum ActivePane {
+    Connections,
+    Databases,
+    Query,
+    Documents,
+}
+
+#[derive(Debug, Clone)]
+enum PopupState {
+    None,
+    ConnectionManager {
+        name: TextArea<'static>,
+        uri: TextArea<'static>,
+        is_editing_uri: bool, // Toggle focus between name/uri
+    },
+    JsonViewer(String),
+    FieldSelector(ListState),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ViewMode {
+    Table,
+    Json,
+}
+
+#[derive(Debug, Clone)]
+enum TreeItem {
+    Database(usize), // index in self.databases
+    Collection(usize, usize), // (db_index, coll_index)
+}
+
+pub struct MongoViewer {
+    action_tx: Option<UnboundedSender<Action>>,
+    mongo_core: MongoCore,
+
+    // State
+    connections: Vec<Connection>,
+    databases: Vec<DatabaseInfo>,
+    documents: Vec<mongo_core::bson::Document>,
+    selected_conn_index: Option<usize>,
+    
+    // Database List State
+    expanded_dbs: HashSet<String>,
+    tree_items: Vec<TreeItem>,
+    selected_tree_index: Option<usize>,
+
+    selected_db_index: Option<usize>, // Keeping track of context for queries
+    selected_coll_index: Option<usize>,
+
+    // UI State
+    active_pane: ActivePane,
+    popup_state: PopupState,
+    view_mode: ViewMode,
+
+    // Inputs
+    query_input: TextArea<'static>,
+    projection_input: TextArea<'static>,
+    sort_input: TextArea<'static>,
+    limit_input: TextArea<'static>,
+
+    // Navigation
+    sidebar_state: ListState,
+    database_list_state: ListState,
+    document_table_state: TableState,
+    document_list_state: ListState,
+
+    // Config
+    visible_fields: Vec<String>,
+    all_fields: Vec<String>,
+    expanded_docs: HashMap<usize, bool>, // For JSON view folding
+}
+
+impl Default for MongoViewer {
+    fn default() -> Self {
+        let mut query = TextArea::default();
+        query.set_placeholder_text("{}");
+        let mut proj = TextArea::default();
+        proj.set_placeholder_text("{}");
+        let mut sort = TextArea::default();
+        sort.set_placeholder_text("{}");
+        let mut limit = TextArea::default();
+        limit.set_placeholder_text("20");
+
+        Self {
+            action_tx: None,
+            mongo_core: MongoCore::new(),
+            connections: vec![],
+            databases: vec![],
+            documents: vec![],
+            selected_conn_index: None,
+            expanded_dbs: HashSet::new(),
+            tree_items: vec![],
+            selected_tree_index: None,
+            selected_db_index: None,
+            selected_coll_index: None,
+            active_pane: ActivePane::Connections,
+            popup_state: PopupState::None,
+            view_mode: ViewMode::Table,
+            query_input: query,
+            projection_input: proj,
+            sort_input: sort,
+            limit_input: limit,
+            sidebar_state: ListState::default(),
+            database_list_state: ListState::default(),
+            document_table_state: TableState::default(),
+            document_list_state: ListState::default(),
+            visible_fields: vec!["_id".to_string()],
+            all_fields: vec![],
+            expanded_docs: HashMap::new(),
+        }
+    }
+}
+
+impl MongoViewer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn cycle_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            ActivePane::Connections => ActivePane::Databases,
+            ActivePane::Databases => ActivePane::Query,
+            ActivePane::Query => ActivePane::Documents,
+            ActivePane::Documents => ActivePane::Connections,
+        };
+    }
+
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Table => ViewMode::Json,
+            ViewMode::Json => ViewMode::Table,
+        };
+    }
+    
+    fn rebuild_tree_items(&mut self) {
+        self.tree_items.clear();
+        for (db_idx, db) in self.databases.iter().enumerate() {
+            self.tree_items.push(TreeItem::Database(db_idx));
+            if self.expanded_dbs.contains(&db.name) {
+                for (coll_idx, _) in db.collections.iter().enumerate() {
+                    self.tree_items.push(TreeItem::Collection(db_idx, coll_idx));
+                }
+            }
+        }
+    }
+}
+
+impl Component for MongoViewer {
+    fn register_action_handler(&mut self, tx: UnboundedSender<Action>) -> Result<()> {
+        self.action_tx = Some(tx);
+        Ok(())
+    }
+
+    fn register_config_handler(&mut self, config: Config) -> Result<()> {
+        self.connections = config.config.connections;
+        Ok(())
+    }
+
+    fn handle_key_events(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        if let PopupState::ConnectionManager { name, uri, is_editing_uri } = &mut self.popup_state {
+             match key.code {
+                 KeyCode::Esc => {
+                     self.popup_state = PopupState::None;
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Tab => {
+                     *is_editing_uri = !*is_editing_uri;
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Enter => {
+                     // Save connection
+                     let n = name.lines().join("");
+                     let u = uri.lines().join("");
+                     if !n.is_empty() && !u.is_empty() {
+                         self.popup_state = PopupState::None;
+                         return Ok(Some(Action::SaveConnection(n, u)));
+                     }
+                 }
+                 _ => {
+                     if *is_editing_uri {
+                         uri.input(key);
+                     } else {
+                         name.input(key);
+                     }
+                     return Ok(Some(Action::Render));
+                 }
+             }
+        }
+        
+        if let PopupState::JsonViewer(_) = self.popup_state {
+             if key.code == KeyCode::Esc {
+                self.popup_state = PopupState::None;
+                return Ok(Some(Action::Render));
+             }
+             return Ok(None);
+        }
+
+        if let PopupState::FieldSelector(state) = &mut self.popup_state {
+             match key.code {
+                 KeyCode::Esc => {
+                     self.popup_state = PopupState::None;
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Down | KeyCode::Char('j') => {
+                     let i = match state.selected() {
+                         Some(i) => {
+                             if i >= self.all_fields.len() - 1 { 0 } else { i + 1 }
+                         }
+                         None => 0,
+                     };
+                     state.select(Some(i));
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Up | KeyCode::Char('k') => {
+                     let i = match state.selected() {
+                         Some(i) => {
+                             if i == 0 { self.all_fields.len() - 1 } else { i - 1 }
+                         }
+                         None => 0,
+                     };
+                     state.select(Some(i));
+                     return Ok(Some(Action::Render));
+                 }
+                 KeyCode::Enter | KeyCode::Char(' ') => {
+                     if let Some(i) = state.selected() {
+                         if let Some(field) = self.all_fields.get(i) {
+                             if self.visible_fields.contains(field) {
+                                 self.visible_fields.retain(|f| f != field);
+                             } else {
+                                 self.visible_fields.push(field.clone());
+                             }
+                         }
+                     }
+                     return Ok(Some(Action::Render));
+                 }
+                 _ => {}
+             }
+             return Ok(None);
+        }
+
+        match key.code {
+            KeyCode::Char('f') => {
+                let mut state = ListState::default();
+                state.select(Some(0));
+                self.popup_state = PopupState::FieldSelector(state);
+                return Ok(Some(Action::Render));
+            }
+            KeyCode::Char('c') if self.active_pane == ActivePane::Connections => {
+                 let mut name = TextArea::default();
+                 name.set_placeholder_text("Connection Name");
+                 let mut uri = TextArea::default();
+                 uri.set_placeholder_text("mongodb://localhost:27017");
+                 self.popup_state = PopupState::ConnectionManager { name, uri, is_editing_uri: false };
+                 return Ok(Some(Action::Render));
+            }
+            KeyCode::Tab => {
+                self.cycle_pane();
+                return Ok(Some(Action::Render));
+            }
+            KeyCode::Char('q') => return Ok(Some(Action::Quit)),
+            KeyCode::Char('v') => {
+                self.toggle_view_mode();
+                return Ok(Some(Action::Render));
+            }
+            _ => {
+                match self.active_pane {
+                    ActivePane::Connections => {
+                          match key.code {
+                              KeyCode::Char('j') | KeyCode::Down => {
+                                  if let Some(idx) = self.selected_conn_index {
+                                      if idx + 1 < self.connections.len() {
+                                          self.selected_conn_index = Some(idx + 1);
+                                          return Ok(Some(Action::Render));
+                                      }
+                                  } else if !self.connections.is_empty() {
+                                      self.selected_conn_index = Some(0);
+                                      return Ok(Some(Action::Render));
+                                  }
+                              }
+                              KeyCode::Char('k') | KeyCode::Up => {
+                                  if let Some(idx) = self.selected_conn_index {
+                                      if idx > 0 {
+                                          self.selected_conn_index = Some(idx - 1);
+                                          return Ok(Some(Action::Render));
+                                      }
+                                  }
+                              }
+                              KeyCode::Enter => {
+                                  if let Some(idx) = self.selected_conn_index {
+                                      if let Some(conn) = self.connections.get(idx) {
+                                          return Ok(Some(Action::Connect(conn.uri.clone())));
+                                      }
+                                  }
+                              }
+                              _ => {}
+                          }
+                    }
+                    ActivePane::Databases => {
+                          match key.code {
+                              KeyCode::Char('j') | KeyCode::Down => {
+                                  if let Some(idx) = self.selected_tree_index {
+                                      if idx + 1 < self.tree_items.len() {
+                                          self.selected_tree_index = Some(idx + 1);
+                                          return Ok(Some(Action::Render));
+                                      }
+                                  } else if !self.tree_items.is_empty() {
+                                      self.selected_tree_index = Some(0);
+                                      return Ok(Some(Action::Render));
+                                  }
+                              }
+                              KeyCode::Char('k') | KeyCode::Up => {
+                                  if let Some(idx) = self.selected_tree_index {
+                                      if idx > 0 {
+                                          self.selected_tree_index = Some(idx - 1);
+                                          return Ok(Some(Action::Render));
+                                      }
+                                  }
+                              }
+                              KeyCode::Enter | KeyCode::Char(' ') => {
+                                  if let Some(idx) = self.selected_tree_index {
+                                      if let Some(item) = self.tree_items.get(idx) {
+                                          match item {
+                                              TreeItem::Database(db_idx) => {
+                                                  if let Some(db) = self.databases.get(*db_idx) {
+                                                      let name = db.name.clone();
+                                                      if self.expanded_dbs.contains(&name) {
+                                                          self.expanded_dbs.remove(&name);
+                                                      } else {
+                                                          self.expanded_dbs.insert(name);
+                                                      }
+                                                      self.rebuild_tree_items();
+                                                      return Ok(Some(Action::Render));
+                                                  }
+                                              },
+                                              TreeItem::Collection(db_idx, coll_idx) => {
+                                                  // Select and fetch
+                                                  self.selected_db_index = Some(*db_idx);
+                                                  self.selected_coll_index = Some(*coll_idx);
+                                                  return Ok(Some(Action::RefreshDocuments));
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                              _ => {}
+                          }
+                    }
+                    ActivePane::Documents => {
+                        // Scroll documents
+                    }
+                    ActivePane::Query => {
+                        match key.code {
+                            KeyCode::Enter => {
+                                // Submit query
+                                return Ok(Some(Action::RefreshDocuments));
+                            }
+                            _ => {
+                                self.query_input.input(key);
+                                return Ok(Some(Action::Render));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+
+    fn update(&mut self, action: Action) -> Result<Option<Action>> {
+        if let Some(action_tx) = &self.action_tx {
+            let tx = action_tx.clone();
+            match action {
+                Action::SaveConnection(name, uri) => {
+                     // TODO: Persist to config
+                     self.connections.push(Connection { name, uri });
+                     // Need to trigger save... but component doesn't have mutable access to Config struct properly 
+                     // unless we inject a save callback or similar.
+                     // For prototype, we just update in-memory.
+                     // A proper way would be emitting an action that App handles to update config.
+                     self.selected_conn_index = Some(self.connections.len() - 1);
+                }
+                Action::Connect(uri) => {
+                    let mongo_core = self.mongo_core.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = mongo_core.connect(&uri).await {
+                             let _ = tx_clone.send(Action::Error(e.to_string()));
+                        } else {
+                             let _ = tx_clone.send(Action::RefreshDatabases);
+                        }
+                    });
+                }
+                Action::RefreshDatabases => {
+                    let mongo_core = self.mongo_core.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        match mongo_core.list_databases().await {
+                            Ok(dbs) => {
+                                let _ = tx_clone.send(Action::DatabasesLoaded(dbs));
+                            },
+                            Err(e) => {
+                                let _ = tx_clone.send(Action::Error(e.to_string()));
+                            }
+                        }
+                    });
+                }
+                Action::DatabasesLoaded(dbs) => {
+                    self.databases = dbs;
+                    self.active_pane = ActivePane::Databases;
+                    self.rebuild_tree_items();
+                    self.selected_tree_index = if !self.tree_items.is_empty() { Some(0) } else { None };
+                }
+                Action::SelectDatabase(idx) => {
+                    // Deprecated action used by old logic, but keeping for compatibility if needed or just removing handling logic
+                    self.selected_db_index = Some(idx);
+                }
+                Action::SelectCollection(idx) => {
+                    self.selected_coll_index = Some(idx);
+                    let _ = tx.send(Action::RefreshDocuments);
+                }
+                Action::RefreshDocuments => {
+                    if let (Some(db_idx), Some(coll_idx)) = (self.selected_db_index, self.selected_coll_index) {
+                         if let Some(db) = self.databases.get(db_idx) {
+                             if let Some(coll) = db.collections.get(coll_idx) {
+                                 let db_name = db.name.clone();
+                                 let coll_name = coll.name.clone();
+                                 let mongo_core = self.mongo_core.clone();
+                                 let tx_clone = tx.clone();
+                                 
+                                 // Simple parsing for now
+                                 let filter_str = self.query_input.lines().join("\n");
+                                 let filter: Option<mongo_core::bson::Document> = if !filter_str.trim().is_empty() {
+                                     match serde_json::from_str::<serde_json::Value>(&filter_str) {
+                                         Ok(val) => match mongo_core::bson::to_document(&val) {
+                                             Ok(doc) => Some(doc),
+                                             Err(e) => {
+                                                 let _ = tx.send(Action::Error(format!("Invalid BSON: {}", e)));
+                                                 None
+                                             }
+                                         },
+                                         Err(e) => {
+                                              let _ = tx.send(Action::Error(format!("Invalid JSON: {}", e)));
+                                              None
+                                         }
+                                     }
+                                 } else {
+                                     None
+                                 };
+                                 
+                                 let projection = None;
+                                 let sort = None;
+                                 let limit = Some(20);
+                                 let skip = None;
+                                 
+                                 tokio::spawn(async move {
+                                     match mongo_core.find_documents(&db_name, &coll_name, filter, projection, sort, limit, skip).await {
+                                         Ok(docs) => {
+                                             let _ = tx_clone.send(Action::DocumentsLoaded(docs));
+                                         },
+                                         Err(e) => {
+                                             let _ = tx_clone.send(Action::Error(e.to_string()));
+                                         }
+                                     }
+                                 });
+                             }
+                         }
+                    }
+                }
+                Action::DocumentsLoaded(docs) => {
+                    self.documents = docs;
+                    // Update all_fields based on keys in the first few documents
+                    let mut fields = std::collections::HashSet::new();
+                    for doc in self.documents.iter().take(20) {
+                        for k in doc.keys() {
+                            fields.insert(k.clone());
+                        }
+                    }
+                    let mut sorted_fields: Vec<String> = fields.into_iter().collect();
+                    sorted_fields.sort();
+                    self.all_fields = sorted_fields;
+                    
+                    // If visible fields is default only, maybe auto-populate? 
+                    // For now keep default "_id"
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn draw(&mut self, f: &mut Frame, area: Rect) -> Result<()> {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1), // Footer
+            ])
+            .split(area);
+
+        let main_area = layout[0];
+        let footer_area = layout[1];
+
+        // Main Layout: Sidebar (Left) | Content (Right)
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
+            .split(main_area);
+
+        // Right Panel: Query Bar (Top) | Documents (Bottom)
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(0)])
+            .split(main_chunks[1]);
+
+        self.draw_sidebar(f, main_chunks[0]);
+        self.draw_query_bar(f, right_chunks[0]);
+        self.draw_documents(f, right_chunks[1]);
+        self.draw_footer(f, footer_area);
+
+        // Use swap to avoid borrow checker issues when we need both &mut self (for rendering stateful widgets maybe?) 
+        // or access to self fields while holding a mutable reference to popup_state content.
+        let mut popup = std::mem::replace(&mut self.popup_state, PopupState::None);
+        
+        match &mut popup {
+            PopupState::JsonViewer(json) => self.draw_json_popup(f, area, json),
+            PopupState::ConnectionManager { name, uri, is_editing_uri } => {
+                self.draw_connection_manager_popup(f, area, name, uri, *is_editing_uri)
+            },
+            PopupState::FieldSelector(state) => {
+                self.draw_field_selector(f, area, state);
+            },
+            PopupState::None => {}
+        }
+        
+        self.popup_state = popup;
+
+        Ok(())
+    }
+}
+
+
+impl MongoViewer {
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(30), // Connections
+                Constraint::Percentage(70), // Databases Tree
+            ])
+            .split(area);
+
+        // Connections List
+        let conn_block = Block::default()
+            .title("Connections (c: add)")
+            .borders(Borders::ALL)
+            .border_style(if self.active_pane == ActivePane::Connections {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
+
+        let conn_items: Vec<ListItem> = self.connections
+            .iter()
+            .map(|conn| ListItem::new(conn.name.clone()))
+            .collect();
+
+        let mut conn_state = ListState::default();
+        conn_state.select(self.selected_conn_index);
+
+        let conn_list = List::new(conn_items)
+            .block(conn_block)
+            .highlight_style(Style::default().bg(Color::Blue));
+        f.render_stateful_widget(conn_list, chunks[0], &mut conn_state);
+
+        // Databases Tree
+        let tree_block = Block::default()
+            .title("Databases")
+            .borders(Borders::ALL)
+            .border_style(if self.active_pane == ActivePane::Databases {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
+
+        let tree_items_widgets: Vec<ListItem> = self.tree_items.iter().map(|item| {
+            match item {
+                TreeItem::Database(idx) => {
+                    let db = &self.databases[*idx];
+                    let prefix = if self.expanded_dbs.contains(&db.name) { "v " } else { "> " };
+                    ListItem::new(format!("{}{}", prefix, db.name)).style(Style::default().add_modifier(Modifier::BOLD))
+                },
+                TreeItem::Collection(db_idx, coll_idx) => {
+                    let db = &self.databases[*db_idx];
+                    let coll = &db.collections[*coll_idx];
+                    ListItem::new(format!("  • {}", coll.name))
+                }
+            }
+        }).collect();
+
+        let mut tree_state = ListState::default();
+        tree_state.select(self.selected_tree_index);
+
+        let tree_list = List::new(tree_items_widgets)
+            .block(tree_block)
+            .highlight_style(Style::default().bg(Color::Blue));
+        f.render_stateful_widget(tree_list, chunks[1], &mut tree_state);
+    }
+
+    fn draw_query_bar(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title("Query Filter")
+            .borders(Borders::ALL)
+            .border_style(if self.active_pane == ActivePane::Query {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
+
+        f.render_widget(&self.query_input, area); // Placeholder implementation
+    }
+
+    fn draw_documents(&mut self, f: &mut Frame, area: Rect) {
+        if self.selected_coll_index.is_none() {
+             // Show help text or empty
+             let block = Block::default().borders(Borders::ALL).title("Info");
+             f.render_widget(Paragraph::new("Select a collection to view documents."), area);
+             return;
+        }
+
+        let block = Block::default()
+            .title(if self.view_mode == ViewMode::Table {
+                "Documents (Table)"
+            } else {
+                "Documents (JSON)"
+            })
+            .borders(Borders::ALL)
+            .border_style(if self.active_pane == ActivePane::Documents {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
+            
+        if self.view_mode == ViewMode::Table {
+             let header_cells = self.visible_fields.iter().map(|h| Cell::from(h.clone()).style(Style::default().fg(Color::Red)));
+             let header = Row::new(header_cells).height(1).bottom_margin(1);
+             
+             let rows: Vec<Row> = self.documents.iter().map(|doc| {
+                 let cells = self.visible_fields.iter().map(|field| {
+                     let val = doc.get(field).map(|v| v.to_string()).unwrap_or_default();
+                     Cell::from(val)
+                 });
+                 Row::new(cells).height(1)
+             }).collect();
+             
+             let widths = self.visible_fields.iter().map(|_| Constraint::Min(10)).collect::<Vec<_>>();
+             let table = Table::new(rows, widths)
+                 .header(header)
+                 .block(block)
+                 .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                 
+             f.render_stateful_widget(table, area, &mut self.document_table_state);
+        } else {
+             // JSON View
+             let items: Vec<ListItem> = self.documents.iter().enumerate().map(|(i, doc)| {
+                 let is_expanded = *self.expanded_docs.get(&i).unwrap_or(&false);
+                 let content = if is_expanded {
+                     serde_json::to_string_pretty(&doc).unwrap_or_default()
+                 } else {
+                     let mut summary = String::from("{ ");
+                     if let Ok(id) = doc.get_object_id("_id") {
+                         summary.push_str(&format!("_id: {}, ", id));
+                     } else if let Some(id) = doc.get("_id") {
+                         summary.push_str(&format!("_id: {}, ", id));
+                     }
+
+
+                     
+                     let mut count = 0;
+                     for (k, v) in doc {
+                         if k == "_id" { continue; }
+                         if count >= 3 { break; }
+                         summary.push_str(&format!("{}: {}, ", k, v));
+                         count += 1;
+                     }
+                     summary.push_str("... }");
+                     summary
+                 };
+                 
+                 ListItem::new(content)
+             }).collect();
+             
+             let list = List::new(items)
+                 .block(block)
+                 .highlight_style(Style::default().bg(Color::Blue));
+                 
+             f.render_stateful_widget(list, area, &mut self.document_list_state);
+        }
+    }
+
+    fn draw_json_popup(&self, f: &mut Frame, area: Rect, json: &str) {
+        let popup_area = centered_rect(area, 80, 80);
+        f.render_widget(Clear, popup_area);
+        let block = Block::default().title("Full JSON").borders(Borders::ALL);
+        let p = Paragraph::new(json.to_string())
+            .block(block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(p, popup_area);
+    }
+
+    fn draw_connection_manager_popup(&self, f: &mut Frame, area: Rect, name: &TextArea<'static>, uri: &TextArea<'static>, is_editing_uri: bool) {
+        let popup_area = centered_rect(area, 60, 40);
+        f.render_widget(Clear, popup_area);
+
+        let block = Block::default()
+            .title("New Connection (Tab to switch, Enter to save, Esc to cancel)")
+            .borders(Borders::ALL);
+        f.render_widget(block, popup_area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([
+                Constraint::Length(3), // Name input
+                Constraint::Length(3), // URI input
+                Constraint::Min(0),
+            ])
+            .split(popup_area);
+
+        let mut name_widget = name.clone();
+        name_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Name")
+                .border_style(if !is_editing_uri { Style::default().fg(Color::Yellow) } else { Style::default() }),
+        );
+        
+        let mut uri_widget = uri.clone();
+        uri_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("URI")
+                .border_style(if is_editing_uri { Style::default().fg(Color::Yellow) } else { Style::default() }),
+        );
+
+        f.render_widget(&name_widget, chunks[0]);
+        f.render_widget(&uri_widget, chunks[1]);
+    }
+
+    fn draw_field_selector(&self, f: &mut Frame, area: Rect, state: &mut ListState) {
+        let popup_area = centered_rect(area, 60, 60);
+        f.render_widget(Clear, popup_area);
+        
+        let block = Block::default()
+            .title("Select Fields (Space/Enter to toggle)")
+            .borders(Borders::ALL);
+            
+        let items: Vec<ListItem> = self.all_fields.iter().map(|field| {
+            let is_selected = self.visible_fields.contains(field);
+            let checkbox = if is_selected { "[x] " } else { "[ ] " };
+            ListItem::new(format!("{}{}", checkbox, field))
+        }).collect();
+        
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(Color::Blue));
+            
+        f.render_stateful_widget(list, popup_area, state);
+    }
+    fn draw_footer(&self, f: &mut Frame, area: Rect) {
+        let help_text = match &self.popup_state {
+            PopupState::ConnectionManager { .. } => "Tab: Next Field | Enter: Save | Esc: Cancel",
+            PopupState::JsonViewer(_) => "Esc: Close",
+            PopupState::FieldSelector(_) => "Space/Enter: Toggle | Esc: Close | \u{2191}/\u{2193}: Nav",
+            PopupState::None => match self.active_pane {
+                ActivePane::Connections => "c: New | Enter: Connect | \u{2191}/\u{2193}: Nav | Tab: Next Pane | q: Quit",
+                ActivePane::Databases => "Space/Enter: Expand/Select | \u{2191}/\u{2193}: Nav | Tab: Next Pane | q: Quit",
+                ActivePane::Documents => "v: View Mode | f: Fields | \u{2191}/\u{2193}: Nav | Tab: Next Pane | q: Quit",
+                ActivePane::Query => "Type query... | Tab: Next Pane | q: Quit",
+            },
+        };
+
+        let block = Block::default().style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        let paragraph = Paragraph::new(Span::styled(help_text, Style::default().add_modifier(Modifier::BOLD)))
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(paragraph, area);
+    }
+}
+
+fn centered_rect(r: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}

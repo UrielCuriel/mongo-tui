@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/mongo_core",
+    "crates/tui_app",
+]
+resolver = "2"
