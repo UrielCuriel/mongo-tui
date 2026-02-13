@@ -26,9 +26,9 @@ impl DatabasesPane {
 
     fn rebuild_tree_items(&mut self, ctx: &MongoContext) {
         let mut items = vec![];
-        for (_db_idx, db) in ctx.databases.iter().enumerate() {
+        for db in ctx.databases.iter() {
             let mut children = vec![];
-            for (_coll_idx, coll) in db.collections.iter().enumerate() {
+            for coll in db.collections.iter() {
                 // Use a composite ID: "db_name:coll_name" for uniqueness and stability
                 let id = format!("{}:{}", db.name, coll.name);
                 children.push(TreeItem::new_leaf(id, coll.name.clone()));
@@ -58,12 +58,9 @@ impl Pane for DatabasesPane {
     }
 
     fn update(&mut self, action: Action, ctx: &mut MongoContext) -> Result<Option<Action>> {
-        match action {
-            Action::DatabasesLoaded(_) => {
-                self.rebuild_tree_items(ctx);
-                // Optionally expand the first one or restore state
-            }
-            _ => {}
+        if let Action::DatabasesLoaded(_) = action {
+            self.rebuild_tree_items(ctx);
+            // Optionally expand the first one or restore state
         }
         Ok(None)
     }

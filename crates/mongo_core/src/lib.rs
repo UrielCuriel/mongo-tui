@@ -14,9 +14,24 @@ pub struct MongoCore {
     pub client: Arc<Mutex<Option<Client>>>,
 }
 
+impl Default for MongoCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollectionInfo {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FindOptions {
+    pub filter: Option<Document>,
+    pub projection: Option<Document>,
+    pub sort: Option<Document>,
+    pub limit: Option<i64>,
+    pub skip: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,11 +83,7 @@ impl MongoCore {
         &self,
         db_name: &str,
         collection_name: &str,
-        filter: Option<Document>,
-        projection: Option<Document>,
-        sort: Option<Document>,
-        limit: Option<i64>,
-        skip: Option<u64>,
+        options: FindOptions,
     ) -> anyhow::Result<Vec<Document>> {
         let guard = self.client.lock().await;
         let Some(client) = &*guard else {
@@ -82,17 +93,17 @@ impl MongoCore {
         let db = client.database(db_name);
         let collection = db.collection::<Document>(collection_name);
 
-        let mut find = collection.find(filter.unwrap_or_default());
-        if let Some(projection) = projection {
+        let mut find = collection.find(options.filter.unwrap_or_default());
+        if let Some(projection) = options.projection {
             find = find.projection(projection);
         }
-        if let Some(sort) = sort {
+        if let Some(sort) = options.sort {
             find = find.sort(sort);
         }
-        if let Some(limit) = limit {
+        if let Some(limit) = options.limit {
             find = find.limit(limit);
         }
-        if let Some(skip) = skip {
+        if let Some(skip) = options.skip {
             find = find.skip(skip);
         }
 

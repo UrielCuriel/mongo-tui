@@ -430,7 +430,7 @@ impl MongoViewer {
         let theme = THEME_SET
             .themes
             .get("base16-ocean.dark")
-            .unwrap_or_else(|| &THEME_SET.themes.values().next().unwrap());
+            .unwrap_or_else(|| THEME_SET.themes.values().next().unwrap());
         let mut h = HighlightLines::new(syntax, theme);
 
         let lines: Vec<Line> = LinesWithEndings::from(json)
@@ -464,13 +464,13 @@ impl MongoViewer {
             .title("Help (Scroll: j/k)")
             .borders(Borders::ALL);
 
-        let mut rows = vec![];
-
         // Global
-        rows.push(Row::new(vec!["Global", "q", "Quit"]));
-        rows.push(Row::new(vec!["Global", "?", "Help"]));
-        rows.push(Row::new(vec!["Global", "Tab", "Cycle Pane"]));
-        rows.push(Row::new(vec!["Global", "1-4", "Switch Pane"]));
+        let mut rows = vec![
+            Row::new(vec!["Global", "q", "Quit"]),
+            Row::new(vec!["Global", "?", "Help"]),
+            Row::new(vec!["Global", "Tab", "Cycle Pane"]),
+            Row::new(vec!["Global", "1-4", "Switch Pane"]),
+        ];
 
         // Panes
         let pane_shortcuts = self.registry.get_all_shortcuts();
@@ -619,8 +619,8 @@ impl Component for MongoViewer {
                     let mut uri = TextArea::default();
                     uri.set_placeholder_text("mongodb://localhost:27017");
                     self.popup_state = PopupState::ConnectionManager {
-                        name,
-                        uri,
+                        name: Box::new(name),
+                        uri: Box::new(uri),
                         is_editing_uri: false,
                     };
                     return Ok(Some(Action::Render));
@@ -758,11 +758,13 @@ impl Component for MongoViewer {
                                         .find_documents(
                                             &db_name,
                                             &coll_name,
-                                            filter,
-                                            proj,
-                                            sort,
-                                            Some(limit),
-                                            Some(skip),
+                                            mongo_core::FindOptions {
+                                                filter,
+                                                projection: proj,
+                                                sort,
+                                                limit: Some(limit),
+                                                skip: Some(skip),
+                                            },
                                         )
                                         .await
                                     {
@@ -811,7 +813,7 @@ impl Component for MongoViewer {
                         .parse::<usize>()
                         .unwrap_or(10);
                     let current = self.context.pagination.current_page;
-                    let max_pages = (total as usize + limit - 1) / limit;
+                    let max_pages = (total as usize).div_ceil(limit);
                     if current + 1 < max_pages {
                         self.context.pagination.current_page += 1;
                         return Ok(Some(Action::RefreshDocuments));

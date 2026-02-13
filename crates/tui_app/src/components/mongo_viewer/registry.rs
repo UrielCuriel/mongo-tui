@@ -26,20 +26,11 @@ pub trait Pane {
     }
 }
 
+#[derive(Default)]
 pub struct PaneRegistry {
     panes: HashMap<PaneId, Box<dyn Pane>>,
     ordered_ids: Vec<PaneId>, // Defines navigation cycle order
     active_pane: Option<PaneId>,
-}
-
-impl Default for PaneRegistry {
-    fn default() -> Self {
-        Self {
-            panes: HashMap::new(),
-            ordered_ids: Vec::new(),
-            active_pane: None,
-        }
-    }
 }
 
 impl PaneRegistry {

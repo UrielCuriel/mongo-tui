@@ -52,7 +52,7 @@ impl Config {
     /// Load configuration with precedence:
     /// 1) Local `.mongo-tui.config.json`
     /// 2) OS config path `config.json`
-    /// If none exists, create a default in the OS config path.
+    ///    If none exists, create a default in the OS config path.
     pub fn new() -> color_eyre::Result<Self, config::ConfigError> {
         let local_file = local_config_file();
         let os_file = os_config_file();

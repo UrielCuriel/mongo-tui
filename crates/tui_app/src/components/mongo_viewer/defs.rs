@@ -26,8 +26,8 @@ pub struct PaginationState {
 pub enum PopupState {
     None,
     ConnectionManager {
-        name: TextArea<'static>,
-        uri: TextArea<'static>,
+        name: Box<TextArea<'static>>,
+        uri: Box<TextArea<'static>>,
         is_editing_uri: bool,
     },
     QueryBuilder {

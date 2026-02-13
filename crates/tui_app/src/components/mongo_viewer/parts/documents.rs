@@ -340,7 +340,7 @@ impl Pane for DocumentsPane {
                 .parse::<usize>()
                 .unwrap_or(10);
             let total_pages = if limit > 0 {
-                (total as usize + limit - 1) / limit
+                (total as usize).div_ceil(limit)
             } else {
                 1
             };

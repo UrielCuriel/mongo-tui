@@ -36,12 +36,9 @@ impl Pane for QueryPane {
         key: KeyEvent,
         _ctx: &mut MongoContext,
     ) -> Result<Option<Action>> {
-        match key.code {
-            KeyCode::Enter => {
-                // Signal to open the Query Builder popup
-                return Ok(Some(Action::OpenQueryBuilder));
-            }
-            _ => {}
+        if key.code == KeyCode::Enter {
+            // Signal to open the Query Builder popup
+            return Ok(Some(Action::OpenQueryBuilder));
         }
         Ok(None)
     }
