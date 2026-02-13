@@ -6,7 +6,7 @@ description = "TUI for mongodb client"
 authors = ["Uriel Curiel <urielcuriel@outlook.com>"]
 
 [dependencies]
-mongo_core = { path = "../mongo_core" }
+mongo_core = { path = "../mongo_core", version = "0.1.0" }
 better-panic = "0.3.0"
 clap = { version = "4.5.20", features = [
     "derive",
@@ -43,9 +43,3 @@ arboard = "3.6.1"
 syntect = "5.3.0"
 syntect-tui = "3.0.6"
 tui-tree-widget = "0.23.0"
-
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true
