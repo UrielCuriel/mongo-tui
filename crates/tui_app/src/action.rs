@@ -24,6 +24,8 @@ pub enum Action {
     ToggleViewMode,
     OpenJsonPopup(String),
     OpenConnectionManager,
+    OpenQueryBuilder,
+    OpenFieldSelector,
     ClosePopup,
 
     // Connection Actions

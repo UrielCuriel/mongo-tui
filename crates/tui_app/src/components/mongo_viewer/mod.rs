@@ -1,0 +1,599 @@
+// use std::rc::Rc;
+// use std::cell::RefCell;
+use color_eyre::eyre::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, BorderType, Clear, Paragraph, Row, Table, TableState, Wrap},
+};
+use tokio::sync::mpsc::UnboundedSender;
+// use tracing::{info, error};
+use tui_textarea::TextArea;
+
+use super::Component;
+use crate::{
+    action::Action,
+    config::Config,
+};
+
+pub mod defs;
+pub mod context;
+pub mod pane_id;
+pub mod registry;
+pub mod parts;
+
+use defs::{PopupState, QueryField};
+use context::MongoContext;
+use pane_id::PaneId;
+use registry::PaneRegistry;
+use parts::{
+    connections::ConnectionsPane,
+    databases::DatabasesPane,
+    documents::DocumentsPane,
+    query::QueryPane,
+};
+
+pub struct MongoViewer {
+    context: MongoContext,
+    registry: PaneRegistry,
+    popup_state: PopupState,
+    
+    // IDs for direct access/switching
+    conn_pane_id: PaneId,
+    db_pane_id: PaneId,
+    query_pane_id: PaneId,
+    doc_pane_id: PaneId,
+}
+
+impl Default for MongoViewer {
+    fn default() -> Self {
+        let mut registry = PaneRegistry::new();
+        let context = MongoContext::new();
+        
+        // Create Panes
+        let conn_pane_id = PaneId::new();
+        let db_pane_id = PaneId::new();
+        let query_pane_id = PaneId::new();
+        let doc_pane_id = PaneId::new();
+        
+        registry.register(ConnectionsPane::new(conn_pane_id));
+        registry.register(DatabasesPane::new(db_pane_id));
+        registry.register(QueryPane::new(query_pane_id));
+        registry.register(DocumentsPane::new(doc_pane_id));
+        
+        // Set initial active
+        registry.set_active(conn_pane_id);
+
+        Self {
+            context,
+            registry,
+            popup_state: PopupState::None,
+            conn_pane_id,
+            db_pane_id,
+            query_pane_id,
+            doc_pane_id,
+        }
+    }
+}
+
+impl MongoViewer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    fn get_global_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("1", "Connections"),
+            ("2", "Databases"),
+            ("3", "Query"),
+            ("4", "Documents"),
+            ("Tab", "Cycle Pane"),
+            ("q", "Quit"),
+            ("?", "Help"),
+        ]
+    }
+
+    fn handle_popup_events(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match &mut self.popup_state {
+            PopupState::Error(_) => {
+                if let KeyCode::Esc | KeyCode::Enter = key.code {
+                    self.popup_state = PopupState::None;
+                    return Ok(Some(Action::Render));
+                }
+                return Ok(None);
+            }
+            PopupState::ConnectionManager { name, uri, is_editing_uri } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.popup_state = PopupState::None;
+                        return Ok(Some(Action::Render));
+                    }
+                    KeyCode::Tab => {
+                        *is_editing_uri = !*is_editing_uri;
+                        return Ok(Some(Action::Render));
+                    }
+                    KeyCode::Enter => {
+                         let n = name.lines().join("");
+                         let u = uri.lines().join("");
+                         if !n.is_empty() && !u.is_empty() {
+                             self.popup_state = PopupState::None;
+                             return Ok(Some(Action::SaveConnection(n, u)));
+                         }
+                    }
+                    _ => {
+                        if *is_editing_uri {
+                            uri.input(key);
+                        } else {
+                            name.input(key);
+                        }
+                        return Ok(Some(Action::Render));
+                    }
+                }
+            }
+             PopupState::JsonViewer(_, _, offset) => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.popup_state = PopupState::None;
+                        return Ok(Some(Action::Render));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *offset = offset.saturating_add(1);
+                        return Ok(Some(Action::Render));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *offset = offset.saturating_sub(1);
+                        return Ok(Some(Action::Render));
+                    }
+                    _ => {}
+                }
+            }
+             PopupState::Help(state) => {
+                 match key.code {
+                     KeyCode::Esc | KeyCode::Char('?') => {
+                         self.popup_state = PopupState::None;
+                         return Ok(Some(Action::Render));
+                     }
+                     KeyCode::Down | KeyCode::Char('j') => {
+                         let i = match state.selected() {
+                             Some(i) => i + 1,
+                             None => 0,
+                         };
+                         state.select(Some(i));
+                         return Ok(Some(Action::Render));
+                     }
+                     KeyCode::Up | KeyCode::Char('k') => {
+                         let i = match state.selected() {
+                             Some(i) => if i == 0 { 0 } else { i - 1 },
+                             None => 0,
+                         };
+                         state.select(Some(i));
+                         return Ok(Some(Action::Render));
+                     }
+                     _ => {}
+                 }
+            }
+            PopupState::QueryBuilder { active_field } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.popup_state = PopupState::None;
+                        self.context.input_validation_errors.clear();
+                        return Ok(Some(Action::Render));
+                    }
+                    KeyCode::Tab => {
+                        *active_field = match active_field {
+                            QueryField::Filter => QueryField::Sort,
+                            QueryField::Sort => QueryField::Projection,
+                            QueryField::Projection => QueryField::Limit,
+                            QueryField::Limit => QueryField::Filter,
+                        };
+                        return Ok(Some(Action::Render));
+                    }
+                    KeyCode::Enter => {
+                         // Simplify validation: just trigger refresh
+                         self.popup_state = PopupState::None;
+                         return Ok(Some(Action::RefreshDocuments));
+                    }
+                     _ => {
+                        match active_field {
+                            QueryField::Filter => { self.context.query_input.input(key); }
+                            QueryField::Sort => { self.context.sort_input.input(key); }
+                            QueryField::Projection => { self.context.projection_input.input(key); }
+                            QueryField::Limit => { self.context.limit_input.input(key); }
+                        }
+                        return Ok(Some(Action::Render));
+                    }
+                }
+            }
+             PopupState::FieldSelector(_state) => {
+                 if let KeyCode::Esc = key.code {
+                     self.popup_state = PopupState::None;
+                     return Ok(Some(Action::Render));
+                 }
+             }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    // Popup Drawing Methods
+    fn draw_error_popup(&self, f: &mut Frame, area: Rect, msg: &str) {
+        let block = Block::default().title("Error").borders(Borders::ALL).style(Style::default().fg(Color::Red));
+        let paragraph = Paragraph::new(msg).block(block).wrap(Wrap { trim: true });
+        let area = centered_rect(60, 20, area);
+        f.render_widget(Clear, area);
+        f.render_widget(paragraph, area);
+    }
+
+    fn draw_connection_manager_popup(&self, f: &mut Frame, area: Rect, name: &TextArea, uri: &TextArea, is_editing_uri: bool) {
+        let area = centered_rect(60, 40, area);
+        f.render_widget(Clear, area);
+        let block = Block::default().title("New Connection").borders(Borders::ALL);
+        f.render_widget(block.clone(), area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(1)])
+            .split(area);
+
+        let name_block = Block::default().borders(Borders::ALL).title("Name");
+        let name_style = if !is_editing_uri { Style::default().fg(Color::Yellow) } else { Style::default() };
+        let mut name_widget = name.clone();
+        name_widget.set_block(name_block);
+        name_widget.set_style(name_style);
+        f.render_widget(&name_widget, chunks[0]);
+
+        let uri_block = Block::default().borders(Borders::ALL).title("URI");
+        let uri_style = if is_editing_uri { Style::default().fg(Color::Yellow) } else { Style::default() };
+        let mut uri_widget = uri.clone();
+        uri_widget.set_block(uri_block);
+        uri_widget.set_style(uri_style);
+        f.render_widget(&uri_widget, chunks[1]);
+        
+        let help = Paragraph::new("Tab: Switch | Enter: Save | Esc: Cancel").alignment(Alignment::Center);
+        f.render_widget(help, chunks[2]);
+    }
+
+    fn draw_query_builder_popup(&self, f: &mut Frame, area: Rect, active_field: &QueryField) {
+        let area = centered_rect(80, 80, area);
+        f.render_widget(Clear, area);
+        let block = Block::default().title("Query Builder").borders(Borders::ALL);
+        f.render_widget(block, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Percentage(40), // Filter
+                Constraint::Percentage(20), // Sort
+                Constraint::Percentage(20), // Projection
+                Constraint::Length(3),      // Limit
+                Constraint::Length(1),      // Help
+            ])
+            .split(area);
+            
+        let draw_input = |f: &mut Frame, chunk: Rect, title: &str, input: &TextArea, is_active: bool| {
+             let mut widget = input.clone();
+             widget.set_block(Block::default().borders(Borders::ALL).title(title));
+             if is_active {
+                 widget.set_style(Style::default().fg(Color::Yellow));
+             }
+             f.render_widget(&widget, chunk);
+        };
+
+        draw_input(f, chunks[0], "Filter (JSON)", &self.context.query_input, *active_field == QueryField::Filter);
+        draw_input(f, chunks[1], "Sort (JSON)", &self.context.sort_input, *active_field == QueryField::Sort);
+        draw_input(f, chunks[2], "Projection (JSON)", &self.context.projection_input, *active_field == QueryField::Projection);
+        draw_input(f, chunks[3], "Limit (Number)", &self.context.limit_input, *active_field == QueryField::Limit);
+        
+        let help = Paragraph::new("Tab: Cycle | Enter: Apply | Esc: Cancel").alignment(Alignment::Center);
+        f.render_widget(help, chunks[4]);
+    }
+
+    fn draw_json_popup(&self, f: &mut Frame, area: Rect, json: &str, title: &str, offset: usize) {
+        let area = centered_rect(80, 80, area);
+        f.render_widget(Clear, area);
+        let block = Block::default().title(format!("JSON View: {}", title)).borders(Borders::ALL);
+        let paragraph = Paragraph::new(json)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((offset as u16, 0));
+        f.render_widget(paragraph, area);
+    }
+    
+    fn draw_help_popup(&self, f: &mut Frame, area: Rect, _state: &TableState) {
+        let area = centered_rect(60, 60, area);
+        f.render_widget(Clear, area);
+        let block = Block::default().title("Help").borders(Borders::ALL);
+        
+        let mut rows = vec![];
+        // Gather all shortcuts from panes
+        // TODO: iterate panes if possible or just hardcode generic help
+        rows.push(Row::new(vec!["Global", "q", "Quit"]));
+        rows.push(Row::new(vec!["Global", "Tab", "Cycle Pane"]));
+        rows.push(Row::new(vec!["Global", "1-4", "Switch Pane"]));
+
+        let _table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(20), Constraint::Percentage(50)])
+            .header(Row::new(vec!["Context", "Key", "Action"]).style(Style::default().add_modifier(Modifier::BOLD)))
+            .block(block)
+            .row_highlight_style(Style::default().bg(Color::Blue));
+            
+        // state is mutable reference in popup_state, but we need &mut for stateful widget
+        // Here we can't easily modify state inside draw unless we clone/refcell.
+        // But render_stateful_widget takes &mut State.
+        // We should handle state in `draw` by passing it down.
+        // For now, let's just render.
+        // Note: passing &mut TableState here is tricky if `popup_state` is borrowed immutably.
+        // See how draw calls this.
+        f.render_widget(_table, area);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+impl Component for MongoViewer {
+    fn register_action_handler(&mut self, tx: UnboundedSender<Action>) -> Result<()> {
+        self.context.action_tx = Some(tx);
+        Ok(())
+    }
+
+    fn register_config_handler(&mut self, config: Config) -> Result<()> {
+        self.context.connections = config.config.connections;
+        Ok(())
+    }
+
+    fn handle_key_events(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        // 1. Handle Popups first
+        if !matches!(self.popup_state, PopupState::None) {
+            return self.handle_popup_events(key);
+        }
+
+        // 2. Global Shortcuts
+        match key.code {
+            KeyCode::Char('q') => return Ok(Some(Action::Quit)),
+            KeyCode::Char('?') => {
+                 let mut state = TableState::default();
+                 state.select(Some(0));
+                 self.popup_state = PopupState::Help(state);
+                 return Ok(Some(Action::Render));
+            }
+            KeyCode::Char('c') if self.registry.active_pane_id() == Some(self.conn_pane_id) => {
+                 return Ok(Some(Action::OpenConnectionManager));
+            }
+            KeyCode::Tab => {
+                self.registry.cycle_next();
+                return Ok(Some(Action::Render));
+            }
+            KeyCode::Char('1') => {
+                self.registry.set_active(self.conn_pane_id);
+                return Ok(Some(Action::Render));
+            }
+             KeyCode::Char('2') => {
+                self.registry.set_active(self.db_pane_id);
+                return Ok(Some(Action::Render));
+            }
+             KeyCode::Char('3') => {
+                self.registry.set_active(self.query_pane_id);
+                return Ok(Some(Action::Render));
+            }
+             KeyCode::Char('4') => {
+                self.registry.set_active(self.doc_pane_id);
+                return Ok(Some(Action::Render));
+            }
+            _ => {}
+        }
+
+        // 3. Active Pane
+        let result = self.registry.handle_key_event(key, &mut self.context)?;
+        if let Some(action) = result {
+            // Handle internal actions immediately
+            match action {
+                Action::OpenConnectionManager => {
+                     let mut name = TextArea::default();
+                     name.set_placeholder_text("Connection Name");
+                     let mut uri = TextArea::default();
+                     uri.set_placeholder_text("mongodb://localhost:27017");
+                     self.popup_state = PopupState::ConnectionManager { name, uri, is_editing_uri: false };
+                     return Ok(Some(Action::Render));
+                }
+                Action::OpenQueryBuilder => {
+                    self.popup_state = PopupState::QueryBuilder { active_field: QueryField::Filter };
+                     return Ok(Some(Action::Render));
+                }
+                Action::OpenJsonPopup(json) => {
+                     self.popup_state = PopupState::JsonViewer(json, "Doc".to_string(), 0);
+                     return Ok(Some(Action::Render));
+                }
+                Action::OpenFieldSelector => {
+                     return Ok(Some(Action::Render));
+                }
+                _ => return Ok(Some(action))
+            }
+        }
+        
+        Ok(None)
+    }
+
+    fn update(&mut self, action: Action) -> Result<Option<Action>> {
+        match &action {
+            Action::SaveConnection(name, uri) => {
+                self.context.connections.push(crate::config::Connection { name: name.clone(), uri: uri.clone() });
+                self.context.selected_connection = Some(self.context.connections.len() - 1);
+            }
+            Action::Connect(uri) => {
+                let mongo_core = self.context.mongo_core.clone();
+                let tx = self.context.action_tx.clone();
+                let uri = uri.clone();
+                tokio::spawn(async move {
+                    if let Some(tx) = tx {
+                         if let Err(e) = mongo_core.connect(&uri).await {
+                             let _ = tx.send(Action::Error(e.to_string()));
+                         } else {
+                             let _ = tx.send(Action::RefreshDatabases);
+                         }
+                    }
+                });
+            }
+            Action::RefreshDatabases => {
+                let mongo_core = self.context.mongo_core.clone();
+                let tx = self.context.action_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(tx) = tx {
+                        match mongo_core.list_databases().await {
+                            Ok(dbs) => { let _ = tx.send(Action::DatabasesLoaded(dbs)); }
+                            Err(e) => { let _ = tx.send(Action::Error(e.to_string())); }
+                        }
+                    }
+                });
+            }
+             Action::DatabasesLoaded(dbs) => {
+                self.context.databases = dbs.clone();
+                self.registry.set_active(self.db_pane_id);
+            }
+             Action::RefreshDocuments => {
+                 if let (Some(db_idx), Some(coll_idx)) = (self.context.selected_db_index, self.context.selected_coll_index) {
+                     if let Some(db) = self.context.databases.get(db_idx) {
+                         if let Some(coll) = db.collections.get(coll_idx) {
+                             let db_name = db.name.clone();
+                             let coll_name = coll.name.clone();
+                             let mongo_core = self.context.mongo_core.clone();
+                             let tx = self.context.action_tx.clone();
+                             
+                             let filter_str = self.context.query_input.lines().join("\n");
+                             let sort_str = self.context.sort_input.lines().join("\n");
+                             let proj_str = self.context.projection_input.lines().join("\n");
+                             let limit_str = self.context.limit_input.lines().join("");
+                             
+                             // ... parsing logic (simplified here) ...
+                             // Ideally move parsing to context helper or util
+                             
+                             tokio::spawn(async move {
+                                  if let Some(tx) = tx {
+                                      let limit = limit_str.parse::<i64>().ok();
+                                      let filter = if !filter_str.trim().is_empty() {
+                                          serde_json::from_str::<serde_json::Value>(&filter_str).ok().and_then(|v| mongo_core::bson::to_document(&v).ok())
+                                      } else { None };
+                                      let sort = if !sort_str.trim().is_empty() {
+                                          serde_json::from_str::<serde_json::Value>(&sort_str).ok().and_then(|v| mongo_core::bson::to_document(&v).ok())
+                                      } else { None };
+                                       let proj = if !proj_str.trim().is_empty() {
+                                          serde_json::from_str::<serde_json::Value>(&proj_str).ok().and_then(|v| mongo_core::bson::to_document(&v).ok())
+                                      } else { None };
+                                      
+                                      match mongo_core.find_documents(&db_name, &coll_name, filter, proj, sort, limit, None).await {
+                                          Ok(docs) => { let _ = tx.send(Action::DocumentsLoaded(docs)); }
+                                          Err(e) => { let _ = tx.send(Action::Error(e.to_string())); }
+                                      }
+                                  }
+                             });
+                         }
+                     }
+                 }
+             }
+             Action::DocumentsLoaded(docs) => {
+                 self.context.documents = docs.clone();
+                 self.registry.set_active(self.doc_pane_id);
+             }
+             Action::Error(msg) => {
+                 self.popup_state = PopupState::Error(msg.clone());
+             }
+            _ => {}
+        }
+
+        self.registry.update_all(action, &mut self.context)?;
+        Ok(None)
+    }
+
+    fn draw(&mut self, f: &mut Frame, area: Rect) -> Result<()> {
+        let global_shortcuts = self.get_global_shortcuts();
+        let global_shortcuts_str = global_shortcuts
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        let global_block = Block::default()
+            .title(" Mongo TUI ")
+            .title_alignment(Alignment::Center)
+            .title_bottom(Line::from(global_shortcuts_str).alignment(Alignment::Center))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded);
+        
+        f.render_widget(global_block.clone(), area);
+        let inner_area = global_block.inner(area);
+
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
+            .split(inner_area);
+
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(0)])
+            .split(main_chunks[1]);
+
+         let sidebar_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(main_chunks[0]);
+            
+         let active_pane_id = self.registry.active_pane_id();
+
+         if let Some(pane) = self.registry.get_pane(self.conn_pane_id) {
+             let is_active = active_pane_id == Some(self.conn_pane_id);
+             pane.draw(f, sidebar_chunks[0], is_active, &self.context)?;
+         }
+         if let Some(pane) = self.registry.get_pane(self.db_pane_id) {
+             let is_active = active_pane_id == Some(self.db_pane_id);
+             pane.draw(f, sidebar_chunks[1], is_active, &self.context)?;
+         }
+         
+         if let Some(pane) = self.registry.get_pane(self.query_pane_id) {
+             let is_active = active_pane_id == Some(self.query_pane_id);
+             pane.draw(f, right_chunks[0], is_active, &self.context)?;
+         }
+         if let Some(pane) = self.registry.get_pane(self.doc_pane_id) {
+             let is_active = active_pane_id == Some(self.doc_pane_id);
+             pane.draw(f, right_chunks[1], is_active, &self.context)?;
+         }
+         
+         // Use swap to handle popup state mutable borrow
+         let mut popup = std::mem::replace(&mut self.popup_state, PopupState::None);
+         
+         match &mut popup {
+             PopupState::ConnectionManager { name, uri, is_editing_uri } => 
+                 self.draw_connection_manager_popup(f, area, name, uri, *is_editing_uri),
+             PopupState::QueryBuilder { active_field } => 
+                 self.draw_query_builder_popup(f, area, active_field),
+             PopupState::JsonViewer(json, title, offset) => 
+                 self.draw_json_popup(f, area, json, title, *offset),
+             PopupState::Help(state) => 
+                 self.draw_help_popup(f, area, state),
+             PopupState::Error(msg) => 
+                 self.draw_error_popup(f, area, msg),
+             _ => {}
+         }
+         
+         self.popup_state = popup;
+         
+        Ok(())
+    }
+}
