@@ -1,0 +1,48 @@
+# Configuración para git-cliff
+# Genera changelogs basados en Conventional Commits
+
+[changelog]
+# Template para el changelog
+body = """
+## Novedades
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}]({{ commit.id }}))
+{% endfor %}
+{% endfor %}
+"""
+# Elimina espacios en blanco del template
+trim = true
+
+[git]
+# Parsea commits convencionales
+conventional_commits = true
+# Filtra commits que no siguen la convención
+filter_unconventional = false
+# Procesa cada línea del mensaje de commit
+split_commits = false
+# Preprocesamiento de commits
+commit_preprocessors = [
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/ucuriel/mongo-tui/issues/${2}))"},
+]
+# Regex para parsear y agrupar commits
+commit_parsers = [
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^doc", group = "Documentation" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactor" },
+    { message = "^style", group = "Styling" },
+    { message = "^test", group = "Testing" },
+    { message = "^chore\\(release\\): prepare for", skip = true },
+    { message = "^chore", group = "Miscellaneous Tasks" },
+    { body = ".*security", group = "Security" },
+]
+# Protege las secciones del changelog para que no sean sobreescritas (si se usa footer)
+protect_breaking_commits = false
+# Filtra commits de tag previos
+filter_commits = false
+# Ordenar commits
+sort_commits = "oldest"
