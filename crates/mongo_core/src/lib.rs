@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use futures::stream::TryStreamExt;
 pub use mongodb::bson;
 use mongodb::{
-    bson::{Document, doc},
-    Client, options::ClientOptions,
+    bson::{doc, Document},
+    options::ClientOptions,
+    Client,
 };
-use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -26,7 +27,9 @@ pub struct DatabaseInfo {
 
 impl MongoCore {
     pub fn new() -> Self {
-        Self { client: Arc::new(Mutex::new(None)) }
+        Self {
+            client: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub async fn connect(&self, uri: &str) -> anyhow::Result<()> {
@@ -135,14 +138,12 @@ impl MongoCore {
         let db = client.database(db_name);
         let collection = db.collection::<Document>(collection_name);
 
-        let pipeline = vec![
-            doc! { "$sample": { "size": 1 } },
-        ];
+        let pipeline = vec![doc! { "$sample": { "size": 1 } }];
         let mut cursor = collection.aggregate(pipeline).await?;
 
         if let Some(doc) = cursor.try_next().await? {
-             let keys: Vec<String> = doc.keys().map(|k| k.to_string()).collect();
-             return Ok(keys);
+            let keys: Vec<String> = doc.keys().map(|k| k.to_string()).collect();
+            return Ok(keys);
         }
 
         Ok(vec![])

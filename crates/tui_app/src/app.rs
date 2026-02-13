@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::{
     action::Action,
-    components::{Component, mongo_viewer::MongoViewer},
+    components::{mongo_viewer::MongoViewer, Component},
     config::Config,
     tui::{Event, Tui},
 };
@@ -125,9 +125,16 @@ impl App {
                 Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
                 Action::Render => self.render(tui)?,
                 Action::SaveConnection(ref name, ref uri) => {
-                    self.config.config.connections.push(crate::config::Connection { name: name.clone(), uri: uri.clone() });
+                    self.config
+                        .config
+                        .connections
+                        .push(crate::config::Connection {
+                            name: name.clone(),
+                            uri: uri.clone(),
+                        });
                     if let Err(e) = self.config.save() {
-                        self.action_tx.send(Action::Error(format!("Failed to save config: {}", e)))?;
+                        self.action_tx
+                            .send(Action::Error(format!("Failed to save config: {}", e)))?;
                     }
                 }
                 _ => {}

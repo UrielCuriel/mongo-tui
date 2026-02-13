@@ -4,8 +4,8 @@ use color_eyre::eyre::Result;
 use crossterm::{
     cursor,
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream,
-        KeyEvent, KeyEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEvent,
+        KeyEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
