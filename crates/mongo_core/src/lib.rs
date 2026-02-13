@@ -103,6 +103,25 @@ impl MongoCore {
         Ok(docs)
     }
 
+    pub async fn count_documents(
+        &self,
+        db_name: &str,
+        collection_name: &str,
+        filter: Option<Document>,
+    ) -> anyhow::Result<u64> {
+        let guard = self.client.lock().await;
+        let Some(client) = &*guard else {
+            return Ok(0);
+        };
+
+        let db = client.database(db_name);
+        let collection = db.collection::<Document>(collection_name);
+        let count = collection
+            .count_documents(filter.unwrap_or_default())
+            .await?;
+        Ok(count)
+    }
+
     pub async fn get_collection_schema(
         &self,
         db_name: &str,

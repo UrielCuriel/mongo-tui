@@ -26,9 +26,9 @@ impl DatabasesPane {
 
     fn rebuild_tree_items(&mut self, ctx: &MongoContext) {
         let mut items = vec![];
-        for (db_idx, db) in ctx.databases.iter().enumerate() {
+        for (_db_idx, db) in ctx.databases.iter().enumerate() {
             let mut children = vec![];
-            for (coll_idx, coll) in db.collections.iter().enumerate() {
+            for (_coll_idx, coll) in db.collections.iter().enumerate() {
                 // Use a composite ID: "db_name:coll_name" for uniqueness and stability
                 let id = format!("{}:{}", db.name, coll.name);
                 children.push(TreeItem::new_leaf(id, coll.name.clone()));
@@ -107,6 +107,7 @@ impl Pane for DatabasesPane {
                             {
                                 ctx.selected_db_index = Some(db_idx);
                                 ctx.selected_coll_index = Some(coll_idx);
+                                ctx.pagination.current_page = 0; // Reset pagination
                                 return Ok(Some(Action::RefreshDocuments));
                             }
                         }

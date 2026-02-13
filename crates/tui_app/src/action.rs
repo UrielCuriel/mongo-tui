@@ -35,7 +35,7 @@ pub enum Action {
 
     // Async Results
     DatabasesLoaded(Vec<mongo_core::DatabaseInfo>),
-    DocumentsLoaded(Vec<mongo_core::bson::Document>),
+    DocumentsLoaded(Vec<mongo_core::bson::Document>, u64),
     SchemaLoaded(Vec<String>),
     ErrorMsg(String),
 }

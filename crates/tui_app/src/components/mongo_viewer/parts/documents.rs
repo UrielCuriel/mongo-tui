@@ -55,7 +55,7 @@ impl Pane for DocumentsPane {
     }
 
     fn get_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
-        let mut s = vec![("Enter", "View"), ("j/k", "Nav")];
+        let mut s = vec![("Enter", "View"), ("j/k", "Nav"), ("n/b", "Page")];
         if self.view_mode == ViewMode::Table {
             s.push(("h/l", "Columns"));
             s.push(("y/Y", "Copy ID/Doc"));
@@ -70,7 +70,7 @@ impl Pane for DocumentsPane {
 
     fn update(&mut self, action: Action, ctx: &mut MongoContext) -> Result<Option<Action>> {
         match action {
-            Action::DocumentsLoaded(_) => {
+            Action::DocumentsLoaded(_, _) => {
                 // Reset visible fields to default
                 self.visible_fields = vec!["_id".to_string()];
 
@@ -127,6 +127,12 @@ impl Pane for DocumentsPane {
             KeyCode::Char('v') => {
                 self.toggle_view_mode();
                 return Ok(Some(Action::Render));
+            }
+            KeyCode::Char('n') => {
+                return Ok(Some(Action::NextPage));
+            }
+            KeyCode::Char('b') => {
+                return Ok(Some(Action::PreviousPage));
             }
             KeyCode::Char('f') => {
                 return Ok(Some(Action::OpenFieldSelector(
@@ -326,7 +332,27 @@ impl Pane for DocumentsPane {
         let view_title = format!(" View: {} ", view_mode_str);
 
         // Doc Count
-        let count_str = format!(" {} docs ", ctx.documents.len());
+        let count_str = if let Some(total) = ctx.pagination.total_count {
+            let limit = ctx
+                .limit_input
+                .lines()
+                .join("")
+                .parse::<usize>()
+                .unwrap_or(10);
+            let total_pages = if limit > 0 {
+                (total as usize + limit - 1) / limit
+            } else {
+                1
+            };
+            format!(
+                " Page {}/{} | {} docs ",
+                ctx.pagination.current_page + 1,
+                total_pages,
+                total
+            )
+        } else {
+            format!(" {} docs ", ctx.documents.len())
+        };
 
         let block = Block::default()
             .title(title)

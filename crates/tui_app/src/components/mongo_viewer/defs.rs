@@ -16,6 +16,12 @@ pub enum ViewMode {
     Json,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct PaginationState {
+    pub current_page: usize,
+    pub total_count: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum PopupState {
     None,

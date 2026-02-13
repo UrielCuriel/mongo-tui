@@ -6,6 +6,7 @@ use mongo_core::{DatabaseInfo, MongoCore};
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::defs::PaginationState;
 use tui_textarea::TextArea;
 
 pub struct MongoContext {
@@ -16,6 +17,7 @@ pub struct MongoContext {
     pub connections: Vec<Connection>,
     pub databases: Vec<DatabaseInfo>,
     pub documents: Vec<Document>,
+    pub pagination: PaginationState,
 
     // Selection Context
     pub selected_connection: Option<usize>,
@@ -42,7 +44,7 @@ impl Default for MongoContext {
         let mut sort = TextArea::default();
         sort.set_placeholder_text("{}");
         let mut limit = TextArea::default();
-        limit.set_placeholder_text("20");
+        limit.set_placeholder_text("10");
 
         Self {
             action_tx: None,
@@ -50,6 +52,7 @@ impl Default for MongoContext {
             connections: vec![],
             databases: vec![],
             documents: vec![],
+            pagination: PaginationState::default(),
             selected_connection: None,
             selected_db_index: None,
             selected_coll_index: None,

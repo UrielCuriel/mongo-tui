@@ -206,6 +206,7 @@ impl MongoViewer {
                     KeyCode::Enter => {
                          // Simplify validation: just trigger refresh
                          self.popup_state = PopupState::None;
+                         self.context.pagination.current_page = 0; // Reset pagination
                          return Ok(Some(Action::RefreshDocuments));
                     }
                      _ => {
@@ -599,13 +600,16 @@ impl Component for MongoViewer {
                              let sort_str = self.context.sort_input.lines().join("\n");
                              let proj_str = self.context.projection_input.lines().join("\n");
                              let limit_str = self.context.limit_input.lines().join("");
+                             let current_page = self.context.pagination.current_page;
                              
                              // ... parsing logic (simplified here) ...
                              // Ideally move parsing to context helper or util
                              
                              tokio::spawn(async move {
                                   if let Some(tx) = tx {
-                                      let limit = limit_str.parse::<i64>().ok();
+                                      let limit = limit_str.parse::<i64>().unwrap_or(10);
+                                      let skip = (current_page as i64 * limit) as u64;
+
                                       let filter = if !filter_str.trim().is_empty() {
                                           serde_json::from_str::<serde_json::Value>(&filter_str).ok().and_then(|v| mongo_core::bson::to_document(&v).ok())
                                       } else { None };
@@ -616,8 +620,16 @@ impl Component for MongoViewer {
                                           serde_json::from_str::<serde_json::Value>(&proj_str).ok().and_then(|v| mongo_core::bson::to_document(&v).ok())
                                       } else { None };
                                       
-                                      match mongo_core.find_documents(&db_name, &coll_name, filter, proj, sort, limit, None).await {
-                                          Ok(docs) => { let _ = tx.send(Action::DocumentsLoaded(docs)); }
+                                      let filter_clone_for_count = filter.clone();
+
+                                      match mongo_core.find_documents(&db_name, &coll_name, filter, proj, sort, Some(limit), Some(skip)).await {
+                                          Ok(docs) => { 
+                                              // Fetch count
+                                              match mongo_core.count_documents(&db_name, &coll_name, filter_clone_for_count).await {
+                                                  Ok(count) => { let _ = tx.send(Action::DocumentsLoaded(docs, count)); }
+                                                  Err(e) => { let _ = tx.send(Action::Error(e.to_string())); }
+                                              }
+                                          }
                                           Err(e) => { let _ = tx.send(Action::Error(e.to_string())); }
                                       }
                                   }
@@ -626,10 +638,28 @@ impl Component for MongoViewer {
                      }
                  }
              }
-             Action::DocumentsLoaded(docs) => {
+             Action::DocumentsLoaded(docs, count) => {
                  self.is_loading = false;
                  self.context.documents = docs.clone();
+                 self.context.pagination.total_count = Some(*count);
                  self.registry.set_active(self.doc_pane_id);
+             }
+             Action::NextPage => {
+                 if let Some(total) = self.context.pagination.total_count {
+                     let limit = self.context.limit_input.lines().join("").parse::<usize>().unwrap_or(10);
+                     let current = self.context.pagination.current_page;
+                     let max_pages = (total as usize + limit - 1) / limit;
+                     if current + 1 < max_pages {
+                         self.context.pagination.current_page += 1;
+                         return Ok(Some(Action::RefreshDocuments));
+                     }
+                 }
+             }
+             Action::PreviousPage => {
+                 if self.context.pagination.current_page > 0 {
+                     self.context.pagination.current_page -= 1;
+                     return Ok(Some(Action::RefreshDocuments));
+                 }
              }
              Action::Error(msg) => {
                  self.is_loading = false;
