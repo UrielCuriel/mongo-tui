@@ -14,6 +14,7 @@ use ratatui::{
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 use syntect_tui::into_span;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::{info, error};
 use tui_textarea::TextArea;
 
 use super::Component;
@@ -53,6 +54,7 @@ enum PopupState {
     JsonViewer(String, String, usize), // json, doc_id, offset
     FieldSelector(ListState),
     Help(TableState),
+    Error(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +249,15 @@ impl Component for MongoViewer {
     }
 
     fn handle_key_events(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        if let PopupState::Error(_) = &self.popup_state {
+             if let KeyCode::Esc | KeyCode::Enter = key.code {
+                 self.popup_state = PopupState::None;
+                 return Ok(Some(Action::Render));
+             }
+             // Consume all keys when error is shown
+             return Ok(None);
+        }
+
         if let PopupState::ConnectionManager {
             name,
             uri,
@@ -927,8 +938,14 @@ impl Component for MongoViewer {
                                     };
 
                                 let limit_str = self.limit_input.lines().join("");
-                                let limit = limit_str.parse::<i64>().ok();
+                                let limit = if limit_str.trim().is_empty() {
+                                    Some(20)
+                                } else {
+                                    limit_str.parse::<i64>().ok()
+                                };
                                 let skip = None;
+
+                                info!("Executing find_documents: db={}, coll={}, filter={:?}, limit={:?}", db_name, coll_name, filter, limit);
 
                                 tokio::spawn(async move {
                                     match mongo_core
@@ -939,9 +956,11 @@ impl Component for MongoViewer {
                                         .await
                                     {
                                         Ok(docs) => {
+                                            info!("Successfully found {} documents", docs.len());
                                             let _ = tx_clone.send(Action::DocumentsLoaded(docs));
                                         }
                                         Err(e) => {
+                                            error!("Error in find_documents: {:?}", e);
                                             let _ = tx_clone.send(Action::Error(e.to_string()));
                                         }
                                     }
@@ -987,6 +1006,9 @@ impl Component for MongoViewer {
                         } else {
                             None
                         });
+                }
+                Action::Error(msg) => {
+                    self.popup_state = PopupState::Error(msg);
                 }
                 _ => {}
             }
@@ -1050,6 +1072,9 @@ impl Component for MongoViewer {
             }
             PopupState::Help(state) => {
                 self.draw_help_popup(f, area, state);
+            }
+            PopupState::Error(msg) => {
+                self.draw_error_popup(f, area, msg);
             }
             PopupState::None => {}
         }
@@ -1412,7 +1437,7 @@ impl MongoViewer {
             [Constraint::Percentage(30), Constraint::Percentage(70)]
         )
         .block(block)
-        .highlight_style(Style::default().bg(Color::DarkGray));
+        .row_highlight_style(Style::default().bg(Color::DarkGray));
         
         f.render_stateful_widget(table, popup_area, state);
     }
@@ -1642,6 +1667,25 @@ impl MongoViewer {
             .highlight_style(Style::default().bg(Color::Blue));
 
         f.render_stateful_widget(list, popup_area, state);
+    }
+
+    fn draw_error_popup(&self, f: &mut Frame, area: Rect, msg: &str) {
+        let popup_area = centered_rect(area, 60, 20);
+        f.render_widget(Clear, popup_area);
+
+        let block = Block::default()
+            .title(" Error (Enter/Esc to dismiss) ")
+            .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Red));
+
+        let text = Paragraph::new(msg)
+            .block(block)
+            .wrap(Wrap { trim: true })
+            .alignment(Alignment::Center);
+
+        f.render_widget(text, popup_area);
     }
 }
 
