@@ -22,11 +22,12 @@ pub enum Action {
     NextPage,
     PreviousPage,
     ToggleViewMode,
-    OpenJsonPopup(String),
+    OpenJsonPopup(String, String), // Json, Title
     OpenConnectionManager,
     OpenQueryBuilder,
-    OpenFieldSelector,
+    OpenFieldSelector(Vec<String>, Vec<String>), // All fields, Visible fields
     ClosePopup,
+    UpdateVisibleFields(Vec<String>),
 
     // Connection Actions
     SaveConnection(String, String), // Name, URI

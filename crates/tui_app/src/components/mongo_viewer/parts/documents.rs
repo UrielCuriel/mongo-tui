@@ -50,6 +50,10 @@ impl Pane for DocumentsPane {
         self.id
     }
 
+    fn name(&self) -> &'static str {
+        "Documents"
+    }
+
     fn get_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
         let mut s = vec![("Enter", "View"), ("j/k", "Nav")];
         if self.view_mode == ViewMode::Table {
@@ -104,7 +108,11 @@ impl Pane for DocumentsPane {
                 self.toggle_view_mode();
                 return Ok(Some(Action::Render));
             }
-            // Add handler for field selection if it comes via Action
+            Action::UpdateVisibleFields(fields) => {
+                self.visible_fields = fields;
+                self.selected_column_index = 0; // Reset to avoid out of bounds
+                return Ok(Some(Action::Render));
+            }
             _ => {}
         }
         Ok(None)
@@ -121,7 +129,10 @@ impl Pane for DocumentsPane {
                 return Ok(Some(Action::Render));
             }
             KeyCode::Char('f') => {
-                return Ok(Some(Action::OpenFieldSelector));
+                return Ok(Some(Action::OpenFieldSelector(
+                    self.all_fields.clone(),
+                    self.visible_fields.clone(),
+                )));
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let len = ctx.documents.len();
@@ -216,12 +227,34 @@ impl Pane for DocumentsPane {
                     if let Some(doc) = ctx.documents.get(idx) {
                         if let Ok(json) = serde_json::to_string_pretty(doc) {
                             // Extract ID for title
-                            let _id_str = if let Ok(id) = doc.get_object_id("_id") {
+                            let id_str = if let Ok(id) = doc.get_object_id("_id") {
+                                id.to_string()
+                            } else if let Some(id) = doc.get("_id") {
                                 id.to_string()
                             } else {
                                 "?".to_string()
                             };
-                            return Ok(Some(Action::OpenJsonPopup(json))); // Need to pass ID too? For now just JSON
+
+                            let mut title_parts = vec![];
+                            if let Some(idx) = ctx.selected_connection {
+                                if let Some(conn) = ctx.connections.get(idx) {
+                                    title_parts.push(conn.name.as_str());
+                                }
+                            }
+                            if let Some(idx) = ctx.selected_db_index {
+                                if let Some(db) = ctx.databases.get(idx) {
+                                    title_parts.push(db.name.as_str());
+                                    if let Some(c_idx) = ctx.selected_coll_index {
+                                        if let Some(coll) = db.collections.get(c_idx) {
+                                            title_parts.push(coll.name.as_str());
+                                        }
+                                    }
+                                }
+                            }
+                            title_parts.push(&id_str);
+                            let title = title_parts.join(" / ");
+
+                            return Ok(Some(Action::OpenJsonPopup(json, title)));
                         }
                     }
                 }
@@ -238,16 +271,68 @@ impl Pane for DocumentsPane {
         is_active: bool,
         ctx: &MongoContext,
     ) -> Result<()> {
-        let shortcuts = self.get_shortcuts();
-        let shortcuts_str = shortcuts
-            .iter()
-            .map(|(k, v)| format!("{}: {}", k, v))
-            .collect::<Vec<_>>()
-            .join(" | ");
+        // Show subset
+        let shortcuts_str = "Enter: View | v: Toggle View | f: Fields";
+
+        // Breadcrumb: Conn / DB / Coll
+        let mut title = "[4] Documents".to_string();
+
+        let mut parts = vec!["[4] ".to_string()];
+
+        if let Some(conn_idx) = ctx.selected_connection {
+            if let Some(conn) = ctx.connections.get(conn_idx) {
+                parts.push(conn.name.clone());
+            }
+        }
+
+        if let (Some(db_idx), Some(coll_idx)) = (ctx.selected_db_index, ctx.selected_coll_index) {
+            if let Some(db) = ctx.databases.get(db_idx) {
+                parts.push(db.name.clone());
+                if let Some(coll) = db.collections.get(coll_idx) {
+                    parts.push(coll.name.clone());
+                }
+            }
+        }
+
+        if parts.len() > 1 {
+            title = parts.join(" / ").replace("[4]  / ", "[4] ");
+            // Cleanup the join artifact if needed, but better logic:
+
+            let mut p = vec![];
+            if let Some(conn_idx) = ctx.selected_connection {
+                if let Some(conn) = ctx.connections.get(conn_idx) {
+                    p.push(conn.name.clone());
+                }
+            }
+            if let (Some(db_idx), Some(coll_idx)) = (ctx.selected_db_index, ctx.selected_coll_index)
+            {
+                if let Some(db) = ctx.databases.get(db_idx) {
+                    p.push(db.name.clone());
+                    if let Some(coll) = db.collections.get(coll_idx) {
+                        p.push(coll.name.clone());
+                    }
+                }
+            }
+            if !p.is_empty() {
+                title = format!("[4] {}", p.join(" / "));
+            }
+        }
+
+        // View Mode
+        let view_mode_str = match self.view_mode {
+            ViewMode::Table => "Table",
+            ViewMode::Json => "JSON",
+        };
+        let view_title = format!(" View: {} ", view_mode_str);
+
+        // Doc Count
+        let count_str = format!(" {} docs ", ctx.documents.len());
 
         let block = Block::default()
-            .title("[4] Documents")
+            .title(title)
+            .title(Line::from(view_title).alignment(Alignment::Right))
             .title_bottom(Line::from(shortcuts_str).alignment(Alignment::Center))
+            .title_bottom(Line::from(count_str).alignment(Alignment::Right))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(if is_active {

@@ -28,7 +28,7 @@ pub enum PopupState {
         active_field: QueryField,
     },
     JsonViewer(String, String, usize), // json, doc_id, offset
-    FieldSelector(ListState),
+    FieldSelector(ListState, Vec<String>, Vec<String>), // State, All, Visible
     Help(TableState),
     Error(String),
 }

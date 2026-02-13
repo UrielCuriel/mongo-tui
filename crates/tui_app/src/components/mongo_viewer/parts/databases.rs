@@ -2,54 +2,55 @@ use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     prelude::*,
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState},
+    widgets::{Block, BorderType, Borders},
 };
-use std::collections::HashSet;
+use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::super::{context::MongoContext, pane_id::PaneId, registry::Pane};
 use crate::action::Action;
 
-#[derive(Debug, Clone)]
-enum TreeItem {
-    Database(usize),          // index in ctx.databases
-    Collection(usize, usize), // (db_index, coll_index)
-}
-
 pub struct DatabasesPane {
     id: PaneId,
-    expanded_dbs: HashSet<String>,
-    tree_items: Vec<TreeItem>,
-    selected_tree_index: Option<usize>,
-    list_state: ListState,
+    state: TreeState<String>,
+    tree_items: Vec<TreeItem<'static, String>>,
 }
 
 impl DatabasesPane {
     pub fn new(id: PaneId) -> Self {
         Self {
             id,
-            expanded_dbs: HashSet::new(),
+            state: TreeState::default(),
             tree_items: vec![],
-            selected_tree_index: None,
-            list_state: ListState::default(),
         }
     }
 
     fn rebuild_tree_items(&mut self, ctx: &MongoContext) {
-        self.tree_items.clear();
+        let mut items = vec![];
         for (db_idx, db) in ctx.databases.iter().enumerate() {
-            self.tree_items.push(TreeItem::Database(db_idx));
-            if self.expanded_dbs.contains(&db.name) {
-                for (coll_idx, _) in db.collections.iter().enumerate() {
-                    self.tree_items.push(TreeItem::Collection(db_idx, coll_idx));
-                }
+            let mut children = vec![];
+            for (coll_idx, coll) in db.collections.iter().enumerate() {
+                // Use a composite ID: "db_name:coll_name" for uniqueness and stability
+                let id = format!("{}:{}", db.name, coll.name);
+                children.push(TreeItem::new_leaf(id, coll.name.clone()));
             }
+
+            // Use db.name for DB ID
+            let id = db.name.clone();
+            items.push(
+                TreeItem::new(id, db.name.clone(), children).expect("Failed to create tree item"),
+            );
         }
+        self.tree_items = items;
     }
 }
 
 impl Pane for DatabasesPane {
     fn id(&self) -> PaneId {
         self.id
+    }
+
+    fn name(&self) -> &'static str {
+        "Databases"
     }
 
     fn get_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
@@ -60,13 +61,7 @@ impl Pane for DatabasesPane {
         match action {
             Action::DatabasesLoaded(_) => {
                 self.rebuild_tree_items(ctx);
-                if !self.tree_items.is_empty() {
-                    self.selected_tree_index = Some(0);
-                    self.list_state.select(Some(0));
-                } else {
-                    self.selected_tree_index = None;
-                    self.list_state.select(None);
-                }
+                // Optionally expand the first one or restore state
             }
             _ => {}
         }
@@ -80,50 +75,46 @@ impl Pane for DatabasesPane {
     ) -> Result<Option<Action>> {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(idx) = self.selected_tree_index {
-                    if idx + 1 < self.tree_items.len() {
-                        self.selected_tree_index = Some(idx + 1);
-                        self.list_state.select(self.selected_tree_index);
-                        return Ok(Some(Action::Render));
-                    }
-                } else if !self.tree_items.is_empty() {
-                    self.selected_tree_index = Some(0);
-                    self.list_state.select(Some(0));
-                    return Ok(Some(Action::Render));
-                }
+                self.state.key_down();
+                return Ok(Some(Action::Render));
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(idx) = self.selected_tree_index {
-                    if idx > 0 {
-                        self.selected_tree_index = Some(idx - 1);
-                        self.list_state.select(self.selected_tree_index);
-                        return Ok(Some(Action::Render));
-                    }
-                }
+                self.state.key_up();
+                return Ok(Some(Action::Render));
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(idx) = self.selected_tree_index {
-                    if let Some(item) = self.tree_items.get(idx) {
-                        match item {
-                            TreeItem::Database(db_idx) => {
-                                if let Some(db) = ctx.databases.get(*db_idx) {
-                                    let name = db.name.clone();
-                                    if self.expanded_dbs.contains(&name) {
-                                        self.expanded_dbs.remove(&name);
-                                    } else {
-                                        self.expanded_dbs.insert(name);
-                                    }
-                                    self.rebuild_tree_items(ctx);
-                                    return Ok(Some(Action::Render));
-                                }
-                            }
-                            TreeItem::Collection(db_idx, coll_idx) => {
-                                ctx.selected_db_index = Some(*db_idx);
-                                ctx.selected_coll_index = Some(*coll_idx);
+                let selected = self.state.selected();
+                if selected.is_empty() {
+                    // No selection or root?
+                    self.state.toggle_selected();
+                    return Ok(Some(Action::Render));
+                }
+
+                let last_id = selected.last().unwrap();
+                // If ID contains ':', it's a collection: "db_name:coll_name"
+                if last_id.contains(':') {
+                    let parts: Vec<&str> = last_id.split(':').collect();
+                    if parts.len() == 2 {
+                        let db_name = parts[0];
+                        let coll_name = parts[1];
+
+                        // Find indices
+                        if let Some(db_idx) = ctx.databases.iter().position(|d| d.name == db_name) {
+                            if let Some(coll_idx) = ctx.databases[db_idx]
+                                .collections
+                                .iter()
+                                .position(|c| c.name == coll_name)
+                            {
+                                ctx.selected_db_index = Some(db_idx);
+                                ctx.selected_coll_index = Some(coll_idx);
                                 return Ok(Some(Action::RefreshDocuments));
                             }
                         }
                     }
+                } else {
+                    // It's a database, just toggle expand/collapse
+                    self.state.toggle_selected();
+                    return Ok(Some(Action::Render));
                 }
             }
             _ => {}
@@ -136,14 +127,10 @@ impl Pane for DatabasesPane {
         f: &mut Frame,
         area: Rect,
         is_active: bool,
-        ctx: &MongoContext,
+        _ctx: &MongoContext,
     ) -> Result<()> {
-        let shortcuts = self.get_shortcuts();
-        let shortcuts_str = shortcuts
-            .iter()
-            .map(|(k, v)| format!("{}: {}", k, v))
-            .collect::<Vec<_>>()
-            .join(" | ");
+        // Show subset
+        let shortcuts_str = "Space/Enter: Expand/Select";
 
         let block = Block::default()
             .title("[2] Databases")
@@ -156,46 +143,12 @@ impl Pane for DatabasesPane {
                 Style::default()
             });
 
-        let items: Vec<ListItem> = self
-            .tree_items
-            .iter()
-            .map(|item| match item {
-                TreeItem::Database(idx) => {
-                    if let Some(db) = ctx.databases.get(*idx) {
-                        let prefix = if self.expanded_dbs.contains(&db.name) {
-                            "v "
-                        } else {
-                            "> "
-                        };
-                        ListItem::new(format!("{}{}", prefix, db.name))
-                            .style(Style::default().add_modifier(Modifier::BOLD))
-                    } else {
-                        ListItem::new("?")
-                    }
-                }
-                TreeItem::Collection(db_idx, coll_idx) => {
-                    if let Some(db) = ctx.databases.get(*db_idx) {
-                        if let Some(coll) = db.collections.get(*coll_idx) {
-                            ListItem::new(format!("  • {}", coll.name))
-                        } else {
-                            ListItem::new("  ?")
-                        }
-                    } else {
-                        ListItem::new("  ?")
-                    }
-                }
-            })
-            .collect();
-
-        // Sync state
-        let mut state = self.list_state.clone();
-        state.select(self.selected_tree_index);
-
-        let list = List::new(items)
+        let tree = Tree::new(&self.tree_items)
+            .expect("all item identifiers are unique")
             .block(block)
-            .highlight_style(Style::default().bg(Color::Blue));
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Blue));
 
-        f.render_stateful_widget(list, area, &mut state);
+        f.render_stateful_widget(tree, area, &mut self.state);
         Ok(())
     }
 }

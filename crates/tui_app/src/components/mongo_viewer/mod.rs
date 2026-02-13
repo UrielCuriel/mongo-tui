@@ -4,11 +4,19 @@ use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, BorderType, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
 };
 use tokio::sync::mpsc::UnboundedSender;
 // use tracing::{info, error};
 use tui_textarea::TextArea;
+use syntect::{
+    easy::HighlightLines,
+    highlighting::ThemeSet,
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
+};
+use syntect_tui::into_span;
+use lazy_static::lazy_static;
 
 use super::Component;
 use crate::{
@@ -33,6 +41,11 @@ use parts::{
     query::QueryPane,
 };
 
+lazy_static! {
+    static ref SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
+    static ref THEME_SET: ThemeSet = ThemeSet::load_defaults();
+}
+
 pub struct MongoViewer {
     context: MongoContext,
     registry: PaneRegistry,
@@ -43,6 +56,10 @@ pub struct MongoViewer {
     db_pane_id: PaneId,
     query_pane_id: PaneId,
     doc_pane_id: PaneId,
+
+    // Loading State
+    is_loading: bool,
+    loading_frame: usize,
 }
 
 impl Default for MongoViewer {
@@ -72,6 +89,8 @@ impl Default for MongoViewer {
             db_pane_id,
             query_pane_id,
             doc_pane_id,
+            is_loading: false,
+            loading_frame: 0,
         }
     }
 }
@@ -83,13 +102,9 @@ impl MongoViewer {
     
     fn get_global_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
         vec![
-            ("1", "Connections"),
-            ("2", "Databases"),
-            ("3", "Query"),
-            ("4", "Documents"),
-            ("Tab", "Cycle Pane"),
             ("q", "Quit"),
             ("?", "Help"),
+            ("Tab", "Cycle"),
         ]
     }
 
@@ -204,12 +219,52 @@ impl MongoViewer {
                     }
                 }
             }
-             PopupState::FieldSelector(_state) => {
-                 if let KeyCode::Esc = key.code {
-                     self.popup_state = PopupState::None;
-                     return Ok(Some(Action::Render));
+            PopupState::FieldSelector(state, all_fields, visible_fields) => {
+                 match key.code {
+                     KeyCode::Esc => {
+                         self.popup_state = PopupState::None;
+                         return Ok(Some(Action::Render));
+                     }
+                     KeyCode::Down | KeyCode::Char('j') => {
+                         let i = match state.selected() {
+                             Some(i) => if i >= all_fields.len().saturating_sub(1) { all_fields.len().saturating_sub(1) } else { i + 1 },
+                             None => 0,
+                         };
+                         state.select(Some(i));
+                         return Ok(Some(Action::Render));
+                     }
+                     KeyCode::Up | KeyCode::Char('k') => {
+                         let i = match state.selected() {
+                             Some(i) => if i == 0 { 0 } else { i - 1 },
+                             None => 0,
+                         };
+                         state.select(Some(i));
+                         return Ok(Some(Action::Render));
+                     }
+                     KeyCode::Enter | KeyCode::Char(' ') => {
+                         if let Some(i) = state.selected() {
+                             if let Some(field) = all_fields.get(i) {
+                                 // Clone visible_fields to modify
+                                 let mut new_visible = visible_fields.clone();
+                                 if new_visible.contains(field) {
+                                     new_visible.retain(|f| f != field);
+                                 } else {
+                                     new_visible.push(field.clone());
+                                 }
+                                 
+                                 // Update the popup state with the new visible fields
+                                 *visible_fields = new_visible.clone();
+                                 
+                                 // Dispatch action to update the main view
+                                 return Ok(Some(Action::UpdateVisibleFields(new_visible)));
+                             }
+                         }
+                         return Ok(Some(Action::Render));
+                     }
+                     _ => {}
                  }
-             }
+                 return Ok(Some(Action::Render));
+            }
             _ => {}
         }
         Ok(None)
@@ -294,38 +349,89 @@ impl MongoViewer {
         let area = centered_rect(80, 80, area);
         f.render_widget(Clear, area);
         let block = Block::default().title(format!("JSON View: {}", title)).borders(Borders::ALL);
-        let paragraph = Paragraph::new(json)
+        
+        let syntax = SYNTAX_SET.find_syntax_by_extension("json").unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+        // base16-ocean.dark is usually available in defaults, otherwise fall back to first available
+        let theme = THEME_SET.themes.get("base16-ocean.dark").unwrap_or_else(|| &THEME_SET.themes.values().next().unwrap());
+        let mut h = HighlightLines::new(syntax, theme);
+
+        let lines: Vec<Line> = LinesWithEndings::from(json)
+            .map(|line| {
+                let ranges: Vec<(syntect::highlighting::Style, &str)> = h.highlight_line(line, &SYNTAX_SET).unwrap_or_default();
+                let spans: Vec<Span> = ranges.into_iter()
+                    .filter_map(|(style, content)| {
+                        into_span((style, content)).ok().map(|mut span| {
+                            span.style.bg = None; // Remove background color to adapt to terminal
+                            span
+                        })
+                    })
+                    .collect();
+                Line::from(spans)
+            })
+            .collect();
+
+        let paragraph = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false })
             .scroll((offset as u16, 0));
         f.render_widget(paragraph, area);
     }
     
-    fn draw_help_popup(&self, f: &mut Frame, area: Rect, _state: &TableState) {
-        let area = centered_rect(60, 60, area);
+    fn draw_help_popup(&self, f: &mut Frame, area: Rect, state: &mut TableState) {
+        let area = centered_rect(70, 70, area);
         f.render_widget(Clear, area);
-        let block = Block::default().title("Help").borders(Borders::ALL);
+        let block = Block::default().title("Help (Scroll: j/k)").borders(Borders::ALL);
         
         let mut rows = vec![];
-        // Gather all shortcuts from panes
-        // TODO: iterate panes if possible or just hardcode generic help
+        
+        // Global
         rows.push(Row::new(vec!["Global", "q", "Quit"]));
+        rows.push(Row::new(vec!["Global", "?", "Help"]));
         rows.push(Row::new(vec!["Global", "Tab", "Cycle Pane"]));
         rows.push(Row::new(vec!["Global", "1-4", "Switch Pane"]));
 
-        let _table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(20), Constraint::Percentage(50)])
+        // Panes
+        let pane_shortcuts = self.registry.get_all_shortcuts();
+        for (pane_name, shortcuts) in pane_shortcuts {
+             for (key, action) in shortcuts {
+                 rows.push(Row::new(vec![pane_name, key, action]));
+             }
+        }
+
+        let table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(20), Constraint::Percentage(50)])
             .header(Row::new(vec!["Context", "Key", "Action"]).style(Style::default().add_modifier(Modifier::BOLD)))
             .block(block)
             .row_highlight_style(Style::default().bg(Color::Blue));
             
-        // state is mutable reference in popup_state, but we need &mut for stateful widget
-        // Here we can't easily modify state inside draw unless we clone/refcell.
-        // But render_stateful_widget takes &mut State.
-        // We should handle state in `draw` by passing it down.
-        // For now, let's just render.
-        // Note: passing &mut TableState here is tricky if `popup_state` is borrowed immutably.
-        // See how draw calls this.
-        f.render_widget(_table, area);
+        f.render_stateful_widget(table, area, state);
+    }
+    fn draw_field_selector_popup(&self, f: &mut Frame, area: Rect, state: &mut ListState, all_fields: &[String], visible_fields: &[String]) {
+        let area = centered_rect(50, 60, area);
+        f.render_widget(Clear, area);
+        let block = Block::default().title("Select Fields").borders(Borders::ALL);
+        
+        let items: Vec<ListItem> = all_fields
+            .iter()
+            .map(|field| {
+                let is_selected = visible_fields.contains(field);
+                let text = if is_selected {
+                    format!("[x] {}", field)
+                } else {
+                    format!("[ ] {}", field)
+                };
+                ListItem::new(text).style(if is_selected {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                })
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(Color::Blue));
+            
+        f.render_stateful_widget(list, area, state);
     }
 }
 
@@ -418,13 +524,16 @@ impl Component for MongoViewer {
                     self.popup_state = PopupState::QueryBuilder { active_field: QueryField::Filter };
                      return Ok(Some(Action::Render));
                 }
-                Action::OpenJsonPopup(json) => {
-                     self.popup_state = PopupState::JsonViewer(json, "Doc".to_string(), 0);
+                Action::OpenJsonPopup(json, title) => {
+                     self.popup_state = PopupState::JsonViewer(json, title, 0);
                      return Ok(Some(Action::Render));
                 }
-                Action::OpenFieldSelector => {
-                     return Ok(Some(Action::Render));
-                }
+            Action::OpenFieldSelector(all_fields, visible_fields) => {
+                 let mut state = ListState::default();
+                 state.select(Some(0));
+                 self.popup_state = PopupState::FieldSelector(state, all_fields.clone(), visible_fields.clone());
+                 return Ok(Some(Action::Render));
+            }
                 _ => return Ok(Some(action))
             }
         }
@@ -434,11 +543,17 @@ impl Component for MongoViewer {
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         match &action {
+            Action::Tick => {
+                if self.is_loading {
+                     self.loading_frame = self.loading_frame.wrapping_add(1);
+                }
+            }
             Action::SaveConnection(name, uri) => {
                 self.context.connections.push(crate::config::Connection { name: name.clone(), uri: uri.clone() });
                 self.context.selected_connection = Some(self.context.connections.len() - 1);
             }
             Action::Connect(uri) => {
+                self.is_loading = true;
                 let mongo_core = self.context.mongo_core.clone();
                 let tx = self.context.action_tx.clone();
                 let uri = uri.clone();
@@ -453,6 +568,7 @@ impl Component for MongoViewer {
                 });
             }
             Action::RefreshDatabases => {
+                self.is_loading = true;
                 let mongo_core = self.context.mongo_core.clone();
                 let tx = self.context.action_tx.clone();
                 tokio::spawn(async move {
@@ -465,6 +581,7 @@ impl Component for MongoViewer {
                 });
             }
              Action::DatabasesLoaded(dbs) => {
+                self.is_loading = false;
                 self.context.databases = dbs.clone();
                 self.registry.set_active(self.db_pane_id);
             }
@@ -472,6 +589,7 @@ impl Component for MongoViewer {
                  if let (Some(db_idx), Some(coll_idx)) = (self.context.selected_db_index, self.context.selected_coll_index) {
                      if let Some(db) = self.context.databases.get(db_idx) {
                          if let Some(coll) = db.collections.get(coll_idx) {
+                             self.is_loading = true;
                              let db_name = db.name.clone();
                              let coll_name = coll.name.clone();
                              let mongo_core = self.context.mongo_core.clone();
@@ -509,10 +627,12 @@ impl Component for MongoViewer {
                  }
              }
              Action::DocumentsLoaded(docs) => {
+                 self.is_loading = false;
                  self.context.documents = docs.clone();
                  self.registry.set_active(self.doc_pane_id);
              }
              Action::Error(msg) => {
+                 self.is_loading = false;
                  self.popup_state = PopupState::Error(msg.clone());
              }
             _ => {}
@@ -530,13 +650,20 @@ impl Component for MongoViewer {
             .collect::<Vec<_>>()
             .join(" | ");
 
-        let global_block = Block::default()
+        let mut global_block = Block::default()
             .title(" Mongo TUI ")
             .title_alignment(Alignment::Center)
             .title_bottom(Line::from(global_shortcuts_str).alignment(Alignment::Center))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
         
+        if self.is_loading {
+             let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+             let frame = self.loading_frame / 5 % spinner.len();
+             let text = format!(" Loading {} ", spinner[frame]);
+             global_block = global_block.title_bottom(Line::from(text).style(Style::default().fg(Color::Cyan)).alignment(Alignment::Left));
+        }
+
         f.render_widget(global_block.clone(), area);
         let inner_area = global_block.inner(area);
 
@@ -587,8 +714,10 @@ impl Component for MongoViewer {
                  self.draw_json_popup(f, area, json, title, *offset),
              PopupState::Help(state) => 
                  self.draw_help_popup(f, area, state),
-             PopupState::Error(msg) => 
-                 self.draw_error_popup(f, area, msg),
+              PopupState::Error(msg) => 
+                  self.draw_error_popup(f, area, msg),
+              PopupState::FieldSelector(state, all_fields, visible_fields) =>
+                  self.draw_field_selector_popup(f, area, state, all_fields, visible_fields),
              _ => {}
          }
          

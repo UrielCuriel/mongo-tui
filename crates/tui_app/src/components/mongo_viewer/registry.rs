@@ -10,6 +10,7 @@ use crate::action::Action;
 
 pub trait Pane {
     fn id(&self) -> PaneId;
+    fn name(&self) -> &'static str;
     fn handle_key_event(&mut self, key: KeyEvent, ctx: &mut MongoContext)
         -> Result<Option<Action>>;
     fn draw(
@@ -114,5 +115,15 @@ impl PaneRegistry {
             let _ = pane.update(action.clone(), ctx)?;
         }
         Ok(())
+    }
+
+    pub fn get_all_shortcuts(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+        let mut result = Vec::new();
+        for id in &self.ordered_ids {
+            if let Some(pane) = self.panes.get(id) {
+                result.push((pane.name(), pane.get_shortcuts()));
+            }
+        }
+        result
     }
 }

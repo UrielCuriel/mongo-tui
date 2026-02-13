@@ -27,6 +27,10 @@ impl Pane for ConnectionsPane {
         self.id
     }
 
+    fn name(&self) -> &'static str {
+        "Connections"
+    }
+
     fn get_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
         vec![
             ("c", "Add"),
@@ -83,12 +87,8 @@ impl Pane for ConnectionsPane {
         is_active: bool,
         ctx: &MongoContext,
     ) -> Result<()> {
-        let shortcuts = self.get_shortcuts();
-        let shortcuts_str = shortcuts
-            .iter()
-            .map(|(k, v)| format!("{}: {}", k, v))
-            .collect::<Vec<_>>()
-            .join(" | ");
+        // Show subset of shortcuts in title
+        let shortcuts_str = "c: Add | Enter: Connect | Del: Remove";
 
         let block = Block::default()
             .title("[1] Connections")

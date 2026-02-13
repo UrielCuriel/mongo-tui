@@ -23,6 +23,10 @@ impl Pane for QueryPane {
         self.id
     }
 
+    fn name(&self) -> &'static str {
+        "Query"
+    }
+
     fn get_shortcuts(&self) -> Vec<(&'static str, &'static str)> {
         vec![("Enter", "Edit")]
     }
