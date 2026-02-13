@@ -405,9 +405,13 @@ impl Pane for DocumentsPane {
                 .documents
                 .iter()
                 .map(|doc| {
-                    // Simplified JSON view for list
-                    let json = serde_json::to_string(doc).unwrap_or_default();
-                    ListItem::new(json)
+                    // Prettified JSON view for list
+                    let json = serde_json::to_string_pretty(doc).unwrap_or_default();
+                    let lines: Vec<Line> = json
+                        .lines()
+                        .map(|line| Line::from(line.to_string()))
+                        .collect();
+                    ListItem::new(lines)
                 })
                 .collect();
 
