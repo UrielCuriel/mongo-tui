@@ -330,10 +330,12 @@ impl MongoViewer {
             
         let draw_input = |f: &mut Frame, chunk: Rect, title: &str, input: &TextArea, is_active: bool| {
              let mut widget = input.clone();
-             widget.set_block(Block::default().borders(Borders::ALL).title(title));
+             let mut block = Block::default().borders(Borders::ALL).title(title);
              if is_active {
-                 widget.set_style(Style::default().fg(Color::Yellow));
+                 block = block.border_style(Style::default().fg(Color::Yellow));
+                 widget.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
              }
+             widget.set_block(block);
              f.render_widget(&widget, chunk);
         };
 

@@ -95,7 +95,7 @@ impl Pane for QueryPane {
                 Span::raw(" | "),
                 Span::styled("Limit: ", Style::default().fg(Color::Cyan)),
                 Span::raw(if limit_line.is_empty() {
-                    "20"
+                    "10"
                 } else {
                     &limit_line
                 }),
